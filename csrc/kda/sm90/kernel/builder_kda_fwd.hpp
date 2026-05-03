@@ -70,7 +70,9 @@ struct FlatBuilderKdaFwd<
     static constexpr bool kIsPersistent = find_option_t<Tag::kIsPersistent, false_type, Options>::value;
     static_assert(!kIsPersistent, "not implemented");
 
-    using TileScheduler = kda::sm90::kernel::IndividualTileScheduler;
+    static constexpr int kNumSegments =
+        find_option_t<Tag::kNumSegments, std::integral_constant<int, 1>, Options>::value;
+    using TileScheduler = kda::sm90::kernel::ChunkWiseParallelTileScheduler<kNumSegments>;
     // using TileScheduler = std::conditional_t<kIsPersistent, kda::sm90::kernel::PersistentTileScheduler,
     // kda::sm90::kernel::IndividualTileScheduler>;
 

@@ -82,6 +82,7 @@ enum class Tag {
     kInitStateFromInput,  // if true, initialize state by reading global memory instead of zero initialization.
     kSafeGate,            // KDA
     kElementBetaGmem,     // GMEM element type for beta (default float, can be bf16)
+    kNumSegments,         // ChunkWiseParallel: split each (seq, head)'s T-axis into N segments to expand grid
 };
 
 }  // namespace kda::sm90::kernel
