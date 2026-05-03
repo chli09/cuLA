@@ -91,6 +91,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     static constexpr bool kInitStateFromInput = find_option_t<Tag::kInitStateFromInput, false_type, Options>::value;
 
+    // ChunkWiseParallel: split each (seq, head)'s T-axis into kNumSegments parallel work items.
+    // Default 1 → kv_load / kv_store layouts collapse to the original [K, V, H, N_seq] memory.
+    static constexpr int kNumSegments =
+        find_option_t<Tag::kNumSegments, std::integral_constant<int, 1>, Options>::value;
+
     static constexpr int NumLoadWarpGroups = 1;
     static constexpr int NumStateMmaWarpGroups = 2;
     static constexpr int NumAuxMmaWarpGroups = 1;
@@ -897,14 +902,19 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             return tSKrV;
         };
 
+        // GMEM state layout: (K, V, H, N_seg, N_seq) LayoutLeft. With kNumSegments==1 the
+        // size-1 N_seg dim is degenerate — strides past H stay at K*V*H, so the byte address
+        // computed below is bit-identical to the legacy 4D layout (K, V, H, N_seq).
         auto kv_load = [&](auto& tKVrKV) INLINE_LAMBDA {
             DPRINTF0_WG("[%d,%d,%d,%d]>> load tKVgKV -> tKVrKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
             int num_state_heads = problem_size.num_heads;
             int state_head_idx = work_desc.o_head_idx();
+            int seg_idx = work_desc.seg_idx;
             auto gKV = make_tensor(
                 make_gmem_ptr(params.ptr_input_state),
-                make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs)))(
-                _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
+                make_layout(make_shape(
+                    Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, Int<kNumSegments>{}, problem_size.num_seqs)))(
+                _, _, state_head_idx, seg_idx, seq_idx);  // (KDim, VDim), K-contiguous
 
             auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
@@ -917,10 +927,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             DPRINTF0_WG("[%d,%d,%d,%d]>> save tKVrKV -> tKVgKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
             int num_state_heads = problem_size.num_heads;
             int state_head_idx = work_desc.o_head_idx();
+            int seg_idx = work_desc.seg_idx;
             auto gKV = make_tensor(
                 make_gmem_ptr(params.ptr_output_state),
-                make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs)))(
-                _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
+                make_layout(make_shape(
+                    Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, Int<kNumSegments>{}, problem_size.num_seqs)))(
+                _, _, state_head_idx, seg_idx, seq_idx);  // (KDim, VDim), K-contiguous
 
             auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
