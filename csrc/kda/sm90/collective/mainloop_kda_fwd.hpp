@@ -608,7 +608,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         MainloopAlphaPipeline& alpha_pipeline,
         AlphaPipelineState& alpha_smem_pipe_write,
         SharedStorage& storage) {
-        int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
+        int32_t num_blocks = ceil_div(work_desc.chunk_len(), get<0>(TileShape{}));
         uint32_t lane_predicate = cute::elect_one_sync();
 
         auto q_collective_load = LoadQ(params.tma_load_q, q_pipeline, storage.smem_q);
@@ -640,7 +640,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         MainloopBetaPipeline& pipeline,
         BetaPipelineState& smem_pipe_write,
         SharedStorage& storage) {
-        int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
+        int32_t num_blocks = ceil_div(work_desc.chunk_len(), get<0>(TileShape{}));
 
         // fuse post inverse diag(beta) into diagonal of IKK
         // auto collective_load = LoadBeta{params.beta_ptr, params.beta_layout, /*oob_value=*/1.0f, pipeline,
@@ -697,7 +697,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             ++alpha_smem_pipe_read;
         };
 
-        int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
+        int32_t num_blocks = ceil_div(work_desc.chunk_len(), get<0>(TileShape{}));
         CUTE_NO_UNROLL
         for (int blk = 0; blk < num_blocks - 1; ++blk) {
             extract_loop_body(blk, /*is_final_block_=*/cute::false_type{});
@@ -716,7 +716,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         MainloopOPipeline& pipeline,
         PipelineState& smem_pipe_read,
         SharedStorageO& storage) {
-        int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
+        int32_t num_blocks = ceil_div(work_desc.chunk_len(), get<0>(TileShape{}));
         uint32_t lane_predicate = cute::elect_one_sync();
 
         auto collective_store = CollectiveStoreO{tma_store, pipeline, storage, tensormaps};
@@ -762,7 +762,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // MAKE NVCC HAPPY!
         constexpr auto zero = Element{};
 
-        int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
+        int32_t num_blocks = ceil_div(work_desc.chunk_len(), get<0>(TileShape{}));
         DPRINTF0_WG("num_blocks: %d\n", num_blocks);
 
         int thread_idx = int(threadIdx.x) - NumLoadThreads;
@@ -2043,7 +2043,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             }
         };
 
-        int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
+        int32_t num_blocks = ceil_div(work_desc.chunk_len(), get<0>(TileShape{}));
         CUTE_NO_UNROLL
         for (int blk = 0; blk < num_blocks - 1; ++blk) {
             compute_aux_loop_body(blk, /*is_final_block_=*/cute::false_type{});
@@ -2054,7 +2054,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     template <typename WorkDesc>
     CUTE_DEVICE int
     valid_seq_len(WorkDesc work_desc, int blk_idx) {
-        int remain_len = work_desc.seq_len - BlkSeqKV * blk_idx;
+        int remain_len = work_desc.chunk_len() - BlkSeqKV * blk_idx;
         return remain_len <= BlkSeqKV ? remain_len : BlkSeqKV;
     }
 };

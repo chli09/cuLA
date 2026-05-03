@@ -216,7 +216,7 @@ struct CollectiveStoreTma {
         if (blk < num_blocks - 1) {
             // intermediate full tiles, always use TMA
             return true;
-        } else if (work_desc.seq_len % SizeN{} == 0 || work_desc.seq_idx == problem_size.num_seqs - 1) {
+        } else if (work_desc.chunk_len() % SizeN{} == 0 || work_desc.seq_idx == problem_size.num_seqs - 1) {
             // 1. last tile but full, also use TMA
             // 2. last tile but last seq, oob can be handled by TMA
             return true;
@@ -287,7 +287,7 @@ struct CollectiveStoreTma {
         __syncwarp();
 
         if (lane_predicate == 1) {
-            uint32_t new_total_seqlen = work_desc.tok_offset + work_desc.seq_len;
+            uint32_t new_total_seqlen = work_desc.tok_offset + work_desc.chunk_len();
             ptx::tensormap_replace_global_dim(ptx::space_global, tensormap, /*ord=*/ptx::n32_t<1>{}, new_total_seqlen);
         }
         __syncwarp();
