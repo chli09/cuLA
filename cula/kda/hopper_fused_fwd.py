@@ -106,25 +106,31 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         # When num_segments > 1, the kernel grid is expanded to B*H*N_seg and
         # each block processes one segment of T/N_seg tokens. Inputs/outputs
         # for state are reshaped from [N_seq, H, K, V] to [N_seq, N_seg, H, K, V].
-        # First segment of each (seq, head) reads the user's initial_state;
-        # subsequent segments must read zero so they emit a "h_ext" (state
-        # contribution if h_initial == 0) — the merge step (C3) chains these.
-        # The o output for seg ≥ 1 is INCORRECT in this single-pass call
-        # because seg's h-trajectory has not been prefixed; the caller is
-        # expected to be a segment-scan orchestrator (see C3) that fixes o
-        # via a second pass.
+        #
+        # `initial_state` accepted in two shapes:
+        #   - [N_seq, H, K, V]               (legacy / user-facing): seg 0 reads it,
+        #                                    seg ≥ 1 reads zero (emits h_ext for merge)
+        #   - [N_seq, N_seg, H, K, V]        (orchestrator pass 2): used as-is, each
+        #                                    seg reads its own pre-prefixed h_initial
+        #
+        # The o output for seg ≥ 1 is INCORRECT after a pass-1 call alone (its
+        # h-trajectory was not prefixed). The orchestrator
+        # `cula_kda_segment_scan_prefill` runs a second pass with the corrected
+        # per-segment h_initial to produce the right o.
         num_seqs = cu_seqlens.shape[0] - 1
         if num_segments > 1:
             head_dim_v = v.shape[-1]
-            seg_initial_state = torch.zeros(
-                (num_seqs, num_segments, num_heads, head_dim, head_dim_v),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            if initial_state is not None:
-                seg_initial_state[:, 0, ...] = initial_state
-            seg_input_state = seg_initial_state
-            seg_output_state = torch.zeros_like(seg_initial_state)
+            seg_shape = (num_seqs, num_segments, num_heads, head_dim, head_dim_v)
+            if initial_state is not None and initial_state.dim() == 5:
+                assert tuple(initial_state.shape) == seg_shape, (
+                    f"5D initial_state must be {seg_shape}, got {tuple(initial_state.shape)}"
+                )
+                seg_input_state = initial_state.contiguous()
+            else:
+                seg_input_state = torch.zeros(seg_shape, dtype=torch.float32, device=q.device)
+                if initial_state is not None:
+                    seg_input_state[:, 0, ...] = initial_state
+            seg_output_state = torch.zeros(seg_shape, dtype=torch.float32, device=q.device)
         else:
             seg_input_state = initial_state
             seg_output_state = None  # let C++ allocate the legacy [N_seq, H, K, V] shape
@@ -273,4 +279,106 @@ def cula_kda_prefill(
         chunk_indices,
         num_segments,
     )
+    return o, final_state
+
+
+@torch.compiler.disable
+def cula_kda_segment_scan_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    safe_gate: bool = False,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
+    num_segments: int = 2,
+    **kwargs,
+):
+    r"""
+    ChunkWiseParallel segment-scan KDA prefill (issue #11 Option C1).
+
+    Splits each (seq, head)'s T-axis into ``num_segments`` parallel work
+    items, expanding the kernel grid from B*H to B*H*N_seg. Targets the
+    small-B/H + long-T regime where the legacy single-pass kernel is grid-
+    underfilled (e.g. B=1, H=4 → grid 4, vs 132 SMs on GH200).
+
+    Two-pass implementation (for num_segments == 2):
+
+      Pass 1: input_state = [user_init, 0] per (seq, head).
+              Kernel emits h_seg[:, 0] = M_0 @ user_init + h_ext_0
+                                       (= correct h after seg 0)
+                           h_seg[:, 1] = h_ext_1
+                                       (= seg-1's local h_ext, init=0)
+              o_pass1[seg=0] is correct, o_pass1[seg=1] is wrong.
+
+      Pass 2: input_state = [user_init, h_seg[:, 0]] per (seq, head).
+              Now seg 1 sees the correct prefixed h_initial. o_pass2 is
+              correct for both segments.
+
+      Final state = h_pass2[:, -1, ...].
+
+    Note (num_segments ≥ 3): requires computing per-segment transition
+    matrices M and chaining them; planned via FLA's
+    `pre_process_fwd_kernel_merged` and `merge_fwd_bwd_kernel`. Not yet
+    implemented — only num_segments == 2 is supported here.
+
+    Args / behavior otherwise identical to ``cula_kda_prefill``.
+    """
+    if num_segments == 1:
+        return cula_kda_prefill(
+            q=q, k=k, v=v, g=g, beta=beta,
+            scale=scale, initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate, lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+            num_segments=1, **kwargs,
+        )
+    if num_segments != 2:
+        raise NotImplementedError(
+            f"cula_kda_segment_scan_prefill currently supports num_segments ∈ {{1, 2}}, "
+            f"got {num_segments}. N≥3 needs the FLA M-chain merge step."
+        )
+
+    # Pass 1: 4D initial_state → forward will expand to [N_seq, 2, H, K, V] with seg 0 = user_init, seg 1 = 0
+    _o_pass1, h_seg = cula_kda_prefill(
+        q=q, k=k, v=v, g=g, beta=beta,
+        scale=scale, initial_state=initial_state,
+        output_final_state=True,  # need h_seg to chain
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate, lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        num_segments=2, **kwargs,
+    )
+    # h_seg shape: [N_seq, 2, H, K, V]
+    # h_seg[:, 0, ...] = correct h after seg 0  (used as h_initial for seg 1 in pass 2)
+    # h_seg[:, 1, ...] = h_ext_1                (discarded — pass 2 will re-derive properly)
+
+    # Pass 2: build 5D initial_state with corrected per-segment h_initial
+    pass2_init = torch.zeros_like(h_seg)
+    if initial_state is not None:
+        pass2_init[:, 0, ...] = initial_state
+    pass2_init[:, 1, ...] = h_seg[:, 0, ...]
+
+    o, h_final_seg = cula_kda_prefill(
+        q=q, k=k, v=v, g=g, beta=beta,
+        scale=scale, initial_state=pass2_init,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate, lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        num_segments=2, **kwargs,
+    )
+    # h_final_seg[:, -1, ...] is the h after the entire sequence (seg 1 final)
+    final_state = h_final_seg[:, -1, ...] if output_final_state else None
     return o, final_state
