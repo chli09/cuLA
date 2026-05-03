@@ -34,12 +34,17 @@ kda_fwd_prefill(
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
     float scale,
-    bool safe_gate) {
+    bool safe_gate,
+    int64_t num_segments = 1) {
     // Q, K, V: [packed_seq, H, D] (already packed by Python layer)
     auto packed_seq = q.size(0);
     auto num_heads = q.size(1);
     auto head_size = q.size(2);
     auto num_seqs = cu_seqlens.size(0) - 1;
+    TORCH_CHECK(
+        num_segments == 1 || num_segments == 2,
+        "num_segments must be 1 or 2 (only those NumSegments instantiations are compiled), got ",
+        num_segments);
 
     // KDA constraint: all head counts must be the same
     TORCH_CHECK(num_heads == k.size(1), "KDA requires num_q_heads == num_k_heads, got ", num_heads, " vs ", k.size(1));
@@ -52,12 +57,20 @@ kda_fwd_prefill(
                                                      {packed_seq, num_heads, head_size},
                                                      torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
-    // Allocate output state if not provided
-    torch::Tensor output_state = output_state_.has_value()
-                                     ? output_state_.value()
-                                     : torch::zeros(
-                                           {num_seqs, num_heads, head_size, head_size},
-                                           torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    // Allocate output state if not provided.
+    // Shape semantics:
+    //   num_segments == 1 → [N_seq, H, K, V]                (legacy, kv_load 5D layout collapses to 4D)
+    //   num_segments  > 1 → [N_seq, num_segments, H, K, V]  (each block writes its own seg slice)
+    torch::Tensor output_state =
+        output_state_.has_value()
+            ? output_state_.value()
+            : (num_segments == 1
+                   ? torch::zeros(
+                         {num_seqs, num_heads, head_size, head_size},
+                         torch::TensorOptions().dtype(torch::kFloat32).device(q.device()))
+                   : torch::zeros(
+                         {num_seqs, num_segments, num_heads, head_size, head_size},
+                         torch::TensorOptions().dtype(torch::kFloat32).device(q.device())));
 
     // Validate dtypes
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
@@ -101,6 +114,17 @@ kda_fwd_prefill(
         auto& input_state = input_state_.value();
         TORCH_CHECK(input_state.dtype() == torch::kFloat32, "input_state must be float32");
         TORCH_CHECK(input_state.is_contiguous(), "input_state must be contiguous");
+        // For num_segments > 1 the caller must pre-allocate [N_seq, num_segments, H, K, V] and
+        // zero-fill seg ≥ 1 slots in the first pass (so they read h_initial = 0 and emit h_ext).
+        if (num_segments > 1) {
+            int64_t expected = num_seqs * num_segments * num_heads * head_size * head_size;
+            TORCH_CHECK(
+                input_state.numel() == expected,
+                "input_state numel mismatch for num_segments > 1: expected ",
+                expected,
+                " (=N_seq*N_seg*H*K*V), got ",
+                input_state.numel());
+        }
         input_state_ptr = input_state.data_ptr<float>();
     }
 
@@ -136,6 +160,7 @@ kda_fwd_prefill(
             static_cast<int64_t>(packed_seq),
             scale,
             safe_gate,
+            static_cast<int32_t>(num_segments),
             static_cast<int32_t>(sm_count));
     } else {
         float const* beta_ptr = beta_.has_value() ? beta_.value().data_ptr<float>() : nullptr;
@@ -157,6 +182,7 @@ kda_fwd_prefill(
             static_cast<int64_t>(packed_seq),
             scale,
             safe_gate,
+            static_cast<int32_t>(num_segments),
             static_cast<int32_t>(sm_count));
     }
 

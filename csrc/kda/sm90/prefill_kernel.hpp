@@ -45,6 +45,7 @@ launch_kda_fwd_prefill_kernel(
     int64_t total_seqlen,
     float scale,
     bool safe_gate,
+    int32_t num_segments = 1,
     int32_t sm_count = 0);
 
 }  // namespace kda::sm90

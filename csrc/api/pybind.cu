@@ -17,6 +17,8 @@
 #include <torch/nn/functional.h>
 #include <torch/python.h>
 
+namespace py = pybind11;
+
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
 void
 ChunkKDAFwdIntra(
@@ -64,7 +66,8 @@ kda_fwd_prefill(
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
     float scale,
-    bool safe_gate);
+    bool safe_gate,
+    int64_t num_segments);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -74,6 +77,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("recompute_w_u_cuda", &ChunkKDAFwdRecompWU);
 #endif
 #if defined(CULA_SM90A_ENABLED)
-    m.def("kda_fwd_prefill", &kda_fwd_prefill);
+    m.def(
+        "kda_fwd_prefill",
+        &kda_fwd_prefill,
+        py::arg("output") = py::none(),
+        py::arg("output_state") = py::none(),
+        py::arg("q"),
+        py::arg("k"),
+        py::arg("v"),
+        py::arg("input_state") = py::none(),
+        py::arg("alpha") = py::none(),
+        py::arg("beta") = py::none(),
+        py::arg("cu_seqlens"),
+        py::arg("workspace_buffer"),
+        py::arg("scale"),
+        py::arg("safe_gate"),
+        py::arg("num_segments") = 1);
 #endif
 }

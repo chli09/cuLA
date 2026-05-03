@@ -29,6 +29,7 @@ template <
     bool NeedsAlpha,
     bool InitStateFromInput,
     bool SafeGate,
+    int NumSegments,
     typename ArchTag,
     typename TO,
     typename TQKV,
@@ -79,30 +80,43 @@ launch_kda_fwd_prefill_kernel(
     int64_t total_seqlen,
     float scale,
     bool safe_gate,
-    int32_t sm_count = 0) {
+    int32_t num_segments,
+    int32_t sm_count) {
     bool needs_beta = beta != nullptr;
     bool needs_alpha = alpha != nullptr;
     bool init_state = input_state != nullptr;
 
-#define LAUNCH(needs_beta, needs_alpha, init_state, safe_gate)                                   \
-    launch_kda_fwd_prefill_kernel_gbai<needs_beta, needs_alpha, init_state, safe_gate, ArchTag>( \
-        stream,                                                                                  \
-        output,                                                                                  \
-        output_state,                                                                            \
-        q,                                                                                       \
-        k,                                                                                       \
-        v,                                                                                       \
-        input_state,                                                                             \
-        alpha,                                                                                   \
-        beta,                                                                                    \
-        cu_seqlens,                                                                              \
-        workspace_buffer,                                                                        \
-        num_seqs,                                                                                \
-        num_heads,                                                                               \
-        head_size,                                                                               \
-        total_seqlen,                                                                            \
-        scale,                                                                                   \
-        sm_count);
+#define LAUNCH_NSEG(NSEG, needs_beta, needs_alpha, init_state, safe_gate)                              \
+    launch_kda_fwd_prefill_kernel_gbai<needs_beta, needs_alpha, init_state, safe_gate, NSEG, ArchTag>( \
+        stream,                                                                                        \
+        output,                                                                                        \
+        output_state,                                                                                  \
+        q,                                                                                             \
+        k,                                                                                             \
+        v,                                                                                             \
+        input_state,                                                                                   \
+        alpha,                                                                                         \
+        beta,                                                                                          \
+        cu_seqlens,                                                                                    \
+        workspace_buffer,                                                                              \
+        num_seqs,                                                                                      \
+        num_heads,                                                                                     \
+        head_size,                                                                                     \
+        total_seqlen,                                                                                  \
+        scale,                                                                                         \
+        sm_count)
+
+#define LAUNCH(needs_beta, needs_alpha, init_state, safe_gate)                                                   \
+    do {                                                                                                         \
+        if (num_segments == 1) {                                                                                 \
+            LAUNCH_NSEG(1, needs_beta, needs_alpha, init_state, safe_gate);                                      \
+        } else if (num_segments == 2) {                                                                          \
+            LAUNCH_NSEG(2, needs_beta, needs_alpha, init_state, safe_gate);                                      \
+        } else {                                                                                                 \
+            throw std::runtime_error("unsupported num_segments (only {1, 2} compiled): " + std::to_string(num_segments)); \
+        }                                                                                                        \
+    } while (0)
+
     if (init_state) {
         if (needs_beta && needs_alpha && safe_gate) {
             LAUNCH(true, true, true, true);
@@ -118,6 +132,7 @@ launch_kda_fwd_prefill_kernel(
     }
 
 #undef LAUNCH
+#undef LAUNCH_NSEG
 }
 
 using bf16 = cute::bfloat16_t;
@@ -142,6 +157,7 @@ launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, float>(
     int64_t total_seqlen,
     float scale,
     bool safe_gate,
+    int32_t num_segments,
     int32_t sm_count);
 
 // TBeta=bf16
@@ -164,6 +180,7 @@ launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     int64_t total_seqlen,
     float scale,
     bool safe_gate,
+    int32_t num_segments,
     int32_t sm_count);
 
 }  // namespace kda::sm90

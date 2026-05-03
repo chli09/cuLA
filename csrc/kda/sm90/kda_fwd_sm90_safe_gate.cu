@@ -23,9 +23,11 @@ namespace kda::sm90 {
 using namespace cute;
 using bf16 = cute::bfloat16_t;
 
-// SafeGate=true, InitState=false
+// ── NumSegments = 1 (legacy single-block-per-(seq,head) path) ────────────────
+
+// SafeGate=true, InitState=false, NSeg=1
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -44,9 +46,9 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, cutlass::arch::Sm90,
     float,
     int32_t);
 
-// SafeGate=true, InitState=true
+// SafeGate=true, InitState=true, NSeg=1
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -65,9 +67,9 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, cutlass::arch::Sm90, 
     float,
     int32_t);
 
-// SafeGate=true, InitState=false, BetaBF16
+// SafeGate=true, InitState=false, BetaBF16, NSeg=1
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -86,9 +88,97 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, cutlass::arch::Sm90,
     float,
     int32_t);
 
-// SafeGate=true, InitState=true, BetaBF16
+// SafeGate=true, InitState=true, BetaBF16, NSeg=1
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t);
+
+// ── NumSegments = 2 (segment-scan first behaviour change) ────────────────────
+// Only the InitState=true paths are instantiated; segment-scan always sets
+// the per-segment input_state buffer (zero for seg≥1 in the first pass).
+
+// SafeGate=true, InitState=true, NSeg=2
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t);
+
+// SafeGate=true, InitState=true, BetaBF16, NSeg=2
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t);
+
+// SafeGate=true, InitState=false, NSeg=2  (matches dispatcher when no init_state passed)
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t);
+
+// SafeGate=true, InitState=false, BetaBF16, NSeg=2
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,

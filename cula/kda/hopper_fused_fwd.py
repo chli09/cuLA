@@ -47,6 +47,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         lower_bound: float | None = None,
         cu_seqlens: torch.IntTensor | None = None,
         chunk_indices: torch.IntTensor | None = None,
+        num_segments: int = 1,
     ):
         chunk_size = 64
         assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
@@ -101,21 +102,48 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         workspace_size = sm_count * 128
         workspace_buffer = _get_cache_buf("hopper_kda_fwd_workspace", workspace_size, q.device)
 
+        # ── ChunkWiseParallel segment-scan setup ─────────────────────────────
+        # When num_segments > 1, the kernel grid is expanded to B*H*N_seg and
+        # each block processes one segment of T/N_seg tokens. Inputs/outputs
+        # for state are reshaped from [N_seq, H, K, V] to [N_seq, N_seg, H, K, V].
+        # First segment of each (seq, head) reads the user's initial_state;
+        # subsequent segments must read zero so they emit a "h_ext" (state
+        # contribution if h_initial == 0) — the merge step (C3) chains these.
+        # The o output for seg ≥ 1 is INCORRECT in this single-pass call
+        # because seg's h-trajectory has not been prefixed; the caller is
+        # expected to be a segment-scan orchestrator (see C3) that fixes o
+        # via a second pass.
+        num_seqs = cu_seqlens.shape[0] - 1
+        if num_segments > 1:
+            head_dim_v = v.shape[-1]
+            seg_initial_state = torch.zeros(
+                (num_seqs, num_segments, num_heads, head_dim, head_dim_v),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            if initial_state is not None:
+                seg_initial_state[:, 0, ...] = initial_state
+            seg_input_state = seg_initial_state
+            seg_output_state = torch.zeros_like(seg_initial_state)
+        else:
+            seg_input_state = initial_state
+            seg_output_state = None  # let C++ allocate the legacy [N_seq, H, K, V] shape
+
         # call the C++ kernel
-        # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_, alpha_, beta_, cu_seqlens, workspace, scale, safe_gate)
         o, final_state = cula_cuda.kda_fwd_prefill(
             None,  # output_ (auto-allocate)
-            None,  # output_state_ (auto-allocate)
+            seg_output_state,  # output_state_ (None → C++ allocates legacy shape; tensor → use as-is)
             q,
             k,
             v,
-            initial_state,  # input_state_
+            seg_input_state,  # input_state_
             g,  # alpha_
             beta,  # beta_
             cu_seqlens,
             workspace_buffer,
             scale,
             safe_gate,
+            num_segments,
         )
 
         # reshape back
@@ -146,6 +174,7 @@ def cula_kda_prefill(
     lower_bound: float | None = None,
     cu_seqlens: torch.IntTensor | None = None,
     chunk_indices: torch.IntTensor | None = None,
+    num_segments: int = 1,
     **kwargs,
 ):
     r"""
@@ -242,5 +271,6 @@ def cula_kda_prefill(
         lower_bound,
         cu_seqlens,
         chunk_indices,
+        num_segments,
     )
     return o, final_state
