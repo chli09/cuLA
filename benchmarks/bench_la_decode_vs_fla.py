@@ -279,50 +279,55 @@ def main():
         nargs="+",
         default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
     )
-    parser.add_argument("--heads", type=int, default=32)
+    parser.add_argument("--heads", type=int, nargs="+", default=[32], help="Q/K head counts to sweep")
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--layer-idx", type=int, default=12)
     parser.add_argument("--num-layers", type=int, default=24)
     args = parser.parse_args()
 
-    H, K, V = args.heads, args.head_dim, args.head_dim
+    K, V = args.head_dim, args.head_dim
 
     print("Lightning Attention Decode Benchmark")
     print("  la_decode (CuTe DSL) vs fla fused_recurrent_fwd (Triton)")
-    print(f"  H={H}, K={K}, V={V}, layer={args.layer_idx}/{args.num_layers}")
+    print(f"  Hs={args.heads}, K={K}, V={V}, layer={args.layer_idx}/{args.num_layers}")
     print("  dtype=bf16, state=fp32, T=1")
 
-    # ── Kernel-only comparison ──────────────────────────────────────────
-    print(f"\n{'=' * 100}")
-    print("  Mode 1: KERNEL-ONLY (pre-allocated buffers, direct kernel dispatch)")
-    print("  fla: kernel + sum(0) with pre-allocated out=; cute: compiled() with pre-created stream")
-    print(f"{'=' * 100}")
-    print(
-        f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | "
-        f"{'speedup':>8} | {'RMSE':>10} | {'Rel MaxDiff':>12} | {'State RMSE':>12}"
-    )
-    print("─" * 90)
-
-    results = []
-    for B in args.batch_sizes:
-        r = run_config(B, H, K, V, args.layer_idx, args.num_layers)
-        results.append(r)
+    all_results = []
+    for H in args.heads:
+        # ── Kernel-only comparison ──────────────────────────────────────────
+        print(f"\n{'=' * 100}")
+        print(f"  H={H}  Mode 1: KERNEL-ONLY (pre-allocated buffers, direct kernel dispatch)")
+        print("  fla: kernel + sum(0) with pre-allocated out=; cute: compiled() with pre-created stream")
+        print(f"{'=' * 100}")
         print(
-            f"{r['B']:>5} | {r['kernel_fla_ms']:>10.4f} | {r['kernel_cute_ms']:>10.4f} | "
-            f"{r['kernel_speedup']:>7.2f}x | {r['rmse']:>10.6f} | "
-            f"{r['rel_maxdiff']:>12.6f} | {r['state_rmse']:>12.8f}"
+            f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | "
+            f"{'speedup':>8} | {'RMSE':>10} | {'Rel MaxDiff':>12} | {'State RMSE':>12}"
         )
+        print("─" * 90)
 
-    # ── Wrapper comparison ──────────────────────────────────────────────
-    print(f"\n{'=' * 100}")
-    print("  Mode 2: WRAPPER (fused_recurrent_fwd vs linear_attention_decode, full call path)")
-    print("  fla: alloc o[NK,B,1,H,V]+ht[B,H,K,V] + kernel + sum(0); cute: cache lookup + CUstream + kernel")
-    print(f"{'=' * 100}")
-    print(f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | {'speedup':>8}")
-    print("─" * 50)
+        results = []
+        for B in args.batch_sizes:
+            r = run_config(B, H, K, V, args.layer_idx, args.num_layers)
+            r["H"] = H
+            results.append(r)
+            print(
+                f"{r['B']:>5} | {r['kernel_fla_ms']:>10.4f} | {r['kernel_cute_ms']:>10.4f} | "
+                f"{r['kernel_speedup']:>7.2f}x | {r['rmse']:>10.6f} | "
+                f"{r['rel_maxdiff']:>12.6f} | {r['state_rmse']:>12.8f}"
+            )
 
-    for r in results:
-        print(f"{r['B']:>5} | {r['wrap_fla_ms']:>10.4f} | {r['wrap_cute_ms']:>10.4f} | {r['wrap_speedup']:>7.2f}x")
+        # ── Wrapper comparison ──────────────────────────────────────────────
+        print(f"\n{'=' * 100}")
+        print(f"  H={H}  Mode 2: WRAPPER (fused_recurrent_fwd vs linear_attention_decode, full call path)")
+        print("  fla: alloc o[NK,B,1,H,V]+ht[B,H,K,V] + kernel + sum(0); cute: cache lookup + CUstream + kernel")
+        print(f"{'=' * 100}")
+        print(f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | {'speedup':>8}")
+        print("─" * 50)
+
+        for r in results:
+            print(f"{r['B']:>5} | {r['wrap_fla_ms']:>10.4f} | {r['wrap_cute_ms']:>10.4f} | {r['wrap_speedup']:>7.2f}x")
+        all_results.extend(results)
+    results = all_results
 
     print()
     print("Notes:")

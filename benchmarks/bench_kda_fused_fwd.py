@@ -67,7 +67,8 @@ cula_kda_fused_fwd = get_kda_fused_fwd(_device)
 # ============================================================
 # Constants
 # ============================================================
-H, D = 64, 128
+D = 128  # KDA head_dim is locked to 128
+DEFAULT_H = 64  # Used by varlen configs (which do not sweep H)
 WARMUP = 25
 N_ITERS = 100
 NCU_MODE = False
@@ -159,7 +160,7 @@ def bench_fixed(configs):
     print("=" * 100)
     results = []
 
-    for B, T in configs:
+    for B, H, T in configs:
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -201,6 +202,7 @@ def bench_fixed(configs):
         results.append(
             {
                 "B": B,
+                "H": H,
                 "T": T,
                 "rmse": rmse,
                 "rel_max": rel_max,
@@ -234,7 +236,7 @@ def bench_varlen(configs):
         T = total_len
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE)
+        inputs = prepare_safe_gate_inputs(1, T, DEFAULT_H, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE)
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
@@ -299,7 +301,7 @@ def print_report(fixed_results, varlen_results):
     print(f"\n\n{sep}")
     print("                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
     print(f"                  cuLA {_SM_TAG} fully-fused vs FLA Triton")
-    print(f"                  H={H}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
+    print(f"                  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}  (varlen H={DEFAULT_H})")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
@@ -310,13 +312,13 @@ def print_report(fixed_results, varlen_results):
         print("\n  [Fixed-Length]")
         print(f"  {'─' * 90}")
         print(
-            f"  {'B':>3s}  {'T':>6s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
+            f"  {'B':>3s}  {'H':>3s}  {'T':>6s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
             f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 90}")
         for r in fixed_results:
             print(
-                f"  {r['B']:3d}  {r['T']:6d}  │  "
+                f"  {r['B']:3d}  {r['H']:3d}  {r['T']:6d}  │  "
                 f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
             )
@@ -368,6 +370,11 @@ def main():
         action="store_true",
         help="Use non-zero initial state (default: False)",
     )
+    parser.add_argument(
+        "--small",
+        action="store_true",
+        help="Use small-B/H/S config sweep for issue #11 baseline (B in {1,2,4,8}, H in {4,8,16}, T in {512,1k,2k,8k})",
+    )
     args = parser.parse_args()
 
     global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE
@@ -385,19 +392,29 @@ def main():
         f"[Device] {torch.cuda.get_device_name(0)}  compute capability {_SM_TAG}  →  using {cula_kda_fused_fwd.__module__}.{cula_kda_fused_fwd.__name__}"
     )
 
-    fixed_configs = [
-        # (B, T)
-        (1, 512),
-        (1, 1024),
-        (1, 4096),
-        (1, 8192),
-        (1, 16384),
-        (2, 512),
-        (2, 1024),
-        (2, 4096),
-        (2, 8192),
-        (2, 16384),
-    ]
+    if args.small:
+        # Issue #11 baseline sweep — small B / H / S to surface SM underutilisation.
+        fixed_configs = [
+            (B, H, T)
+            for B in (1, 2, 4, 8)
+            for H in (4, 8, 16)
+            for T in (512, 1024, 2048, 8192)
+        ]
+    else:
+        # Default sweep — pre-existing large-batch configs (H=64).
+        fixed_configs = [
+            # (B, H, T)
+            (1, 64, 512),
+            (1, 64, 1024),
+            (1, 64, 4096),
+            (1, 64, 8192),
+            (1, 64, 16384),
+            (2, 64, 512),
+            (2, 64, 1024),
+            (2, 64, 4096),
+            (2, 64, 8192),
+            (2, 64, 16384),
+        ]
 
     varlen_configs = build_varlen_configs(
         num_seqs_list=(10, 20),
@@ -407,10 +424,13 @@ def main():
 
     fixed_res, varlen_res = [], []
 
-    if args.mode in ("fixed", "both"):
+    # --small implies fixed-only (varlen sweep is unrelated to issue #11 small-B/H/S work)
+    effective_mode = "fixed" if args.small else args.mode
+
+    if effective_mode in ("fixed", "both"):
         fixed_res = bench_fixed(fixed_configs)
 
-    if args.mode in ("varlen", "both"):
+    if effective_mode in ("varlen", "both"):
         varlen_res = bench_varlen(varlen_configs)
 
     print_report(fixed_res, varlen_res)
