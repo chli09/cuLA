@@ -24,10 +24,10 @@ from cula.kda.hopper_fused_fwd import (
 pytestmark = pytest.mark.sm90_only
 
 
-# T must be divisible by chunk_size * num_segments (chunk_size = 64, N_seg = 2 → T % 128 == 0).
-# Each shape exercises a different small-B/H regime that's the focus of issue #11.
+# T must be divisible by chunk_size * num_segments. Largest tested num_segments
+# is 4 → require T % (64 * 4) = T % 256 == 0.
 SHAPES = [
-    pytest.param(1, 4, 256, id="B1-H4-T256"),       # smallest sane segment (T/N_seg = 128 = 2 chunks)
+    pytest.param(1, 4, 256, id="B1-H4-T256"),       # smallest sane (T/N_seg = 64 = 1 chunk @ N=4)
     pytest.param(1, 4, 1024, id="B1-H4-T1024"),     # mid
     pytest.param(1, 4, 8192, id="B1-H4-T8192"),     # PR1 worst-case shape (cuLA loses 0.52x to FLA)
     pytest.param(1, 8, 2048, id="B1-H8-T2048"),     # slightly more heads
@@ -35,13 +35,17 @@ SHAPES = [
 ]
 
 
+@pytest.mark.parametrize("num_segments", [2, 4], ids=["N2", "N4"])
 @pytest.mark.parametrize("B,H,T", SHAPES)
 @pytest.mark.parametrize("with_init_state", [False, True], ids=["init_zero", "init_random"])
-def test_segment_scan_n2_matches_single_pass(B: int, H: int, T: int, with_init_state: bool):
-    """N_seg=2 segment-scan orchestrator must match single-pass on (o, final_state)."""
+def test_segment_scan_n2_matches_single_pass(B: int, H: int, T: int, with_init_state: bool, num_segments: int):
+    """Segment-scan orchestrator must match single-pass on (o, final_state)
+    for each supported num_segments value."""
     D = 128
     chunk_size = 64
-    assert T % (chunk_size * 2) == 0, f"T={T} not divisible by chunk_size*N_seg=128"
+    assert T % (chunk_size * num_segments) == 0, (
+        f"T={T} not divisible by chunk_size*N_seg={chunk_size * num_segments}"
+    )
 
     torch.manual_seed(0)
     q = torch.rand(B, T, H, D, dtype=torch.bfloat16, device=device)
@@ -78,12 +82,17 @@ def test_segment_scan_n2_matches_single_pass(B: int, H: int, T: int, with_init_s
     # Reference: single-pass fused kernel (the unchanged path; bit-identical to before C2-2)
     o_ref, ht_ref = cula_kda_prefill(**{**common_kw, "num_segments": 1})
 
-    # Under test: 2-pass segment-scan orchestrator
-    o_seg, ht_seg = cula_kda_segment_scan_prefill(**{**common_kw, "num_segments": 2})
+    # Under test: segment-scan orchestrator
+    o_seg, ht_seg = cula_kda_segment_scan_prefill(**{**common_kw, "num_segments": num_segments})
 
     # Tolerance — same as the existing test_kda_fused_fwd checks.
-    assert_close("o (segment_scan vs single_pass)", o_ref, o_seg, 0.005)
-    assert_close("final_state (segment_scan vs single_pass)", ht_ref, ht_seg, 0.005)
+    # For num_segments >= 3 we use FLA's M kernel which uses FLA-recomputed
+    # (w, u, kg). FLA's WY-decomposition output may differ slightly from cuLA's
+    # internal (w, u, kg) — bf16 ops in different orders. Allow a slightly looser
+    # tolerance for N >= 3 (still well within the existing 0.005 budget).
+    tol = 0.005
+    assert_close(f"o (segment_scan N={num_segments} vs single_pass)", o_ref, o_seg, tol)
+    assert_close(f"final_state (segment_scan N={num_segments} vs single_pass)", ht_ref, ht_seg, tol)
 
 
 @pytest.mark.parametrize("B,H,T", [pytest.param(1, 4, 1024, id="B1-H4-T1024")])

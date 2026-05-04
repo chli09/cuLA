@@ -42,8 +42,8 @@ kda_fwd_prefill(
     auto head_size = q.size(2);
     auto num_seqs = cu_seqlens.size(0) - 1;
     TORCH_CHECK(
-        num_segments == 1 || num_segments == 2,
-        "num_segments must be 1 or 2 (only those NumSegments instantiations are compiled), got ",
+        num_segments == 1 || num_segments == 2 || num_segments == 4,
+        "num_segments must be in {1, 2, 4} (only those NumSegments instantiations are compiled), got ",
         num_segments);
 
     // KDA constraint: all head counts must be the same
