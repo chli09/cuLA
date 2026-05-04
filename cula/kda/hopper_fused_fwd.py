@@ -24,6 +24,139 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 import cula.cudac as cula_cuda
 from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepare_uniform_cu_seqlens
 
+CHUNK_SIZE = 64
+
+
+def _kda_hopper_prep(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    *,
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    safe_gate: bool,
+    lower_bound: float | None,
+    cu_seqlens: torch.IntTensor | None,
+    chunk_indices: torch.IntTensor | None,
+    chunk_size: int = CHUNK_SIZE,
+) -> dict:
+    """Run the Triton-side prep stack (cumsum + l2norm + batch flatten + packed reshape).
+
+    Returns a dict of packed tensors ready for the cuLA C++ kernel call. The dict
+    is the only thing the orchestrator needs to call ``_kda_hopper_call_kernel``
+    multiple times without redoing this work — it's the foundation of the
+    pass-dedup optimisation for segment-scan.
+    """
+    assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    head_dim_v = v.shape[-1]
+
+    if cu_seqlens is None:
+        cu_seqlens = prepare_uniform_cu_seqlens(batch_size, seq_len, q.device, torch.int32)
+
+    # set batch size to 1 after handling cu_seqlens
+    if batch_size != 1:
+        q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
+
+    # gate preprocessing
+    if use_gate_in_kernel:
+        if safe_gate:
+            assert lower_bound is not None, "lower_bound must be set when use safe_gate"
+        g = kda_gate_chunk_cumsum(
+            g=g, A_log=A_log, dt_bias=dt_bias, scale=RCP_LN2, chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, lower_bound=lower_bound,
+        )
+    else:
+        g = chunk_local_cumsum(
+            g=g, chunk_size=chunk_size, scale=RCP_LN2,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        )
+
+    if use_qk_l2norm_in_kernel:
+        q, _ = l2norm_fwd(q)
+        k, _ = l2norm_fwd(k)
+
+    # reshape to packed [T, H, D] for the C++ kernel
+    packed_seq = batch_size * seq_len
+    q = q.reshape(packed_seq, num_heads, head_dim).contiguous()
+    k = k.reshape(packed_seq, num_heads, head_dim).contiguous()
+    v = v.reshape(packed_seq, num_heads, head_dim_v).contiguous()
+    g = g.reshape(packed_seq, num_heads, head_dim).contiguous()
+    beta = beta.reshape(packed_seq, num_heads).contiguous()
+
+    sm_count = get_device_sm_count(q.device)
+    workspace_buffer = _get_cache_buf("hopper_kda_fwd_workspace", sm_count * 128, q.device)
+
+    return {
+        "q": q, "k": k, "v": v, "g": g, "beta": beta,
+        "cu_seqlens": cu_seqlens, "workspace_buffer": workspace_buffer,
+        "batch_size": batch_size, "seq_len": seq_len,
+        "num_heads": num_heads, "head_dim": head_dim, "head_dim_v": head_dim_v,
+        "num_seqs": cu_seqlens.shape[0] - 1,
+    }
+
+
+def _kda_hopper_call_kernel(
+    prep: dict,
+    *,
+    scale: float,
+    safe_gate: bool,
+    num_segments: int,
+    initial_state: torch.Tensor | None = None,
+    output_state: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+):
+    """Single C++ kernel invocation against pre-prepared packed tensors.
+
+    initial_state semantics:
+      - num_segments == 1 : 4D ``[N_seq, H, K, V]`` or None
+      - num_segments  > 1 : either 4D (auto-expanded with seg 0 = init, seg ≥ 1 = 0)
+                            or 5D ``[N_seq, N_seg, H, K, V]`` (used as-is — the
+                            orchestrator's pass-2 path)
+
+    output_state: optional pre-allocated output buffer. None lets the C++ side
+    auto-allocate the appropriate shape.
+    """
+    num_seqs = prep["num_seqs"]
+    num_heads = prep["num_heads"]
+    head_dim = prep["head_dim"]
+    head_dim_v = prep["head_dim_v"]
+    device = prep["q"].device
+
+    if num_segments > 1:
+        seg_shape = (num_seqs, num_segments, num_heads, head_dim, head_dim_v)
+        if initial_state is not None and initial_state.dim() == 5:
+            assert tuple(initial_state.shape) == seg_shape, (
+                f"5D initial_state must be {seg_shape}, got {tuple(initial_state.shape)}"
+            )
+            seg_input_state = initial_state.contiguous()
+        else:
+            seg_input_state = torch.zeros(seg_shape, dtype=torch.float32, device=device)
+            if initial_state is not None:
+                seg_input_state[:, 0, ...] = initial_state
+        if output_state is None:
+            output_state = torch.zeros(seg_shape, dtype=torch.float32, device=device)
+    else:
+        seg_input_state = initial_state
+
+    o, final_state = cula_cuda.kda_fwd_prefill(
+        None, output_state,
+        prep["q"], prep["k"], prep["v"],
+        seg_input_state,
+        prep["g"],
+        prep["beta"],
+        prep["cu_seqlens"], prep["workspace_buffer"],
+        scale, safe_gate, num_segments,
+    )
+    o = rearrange(o, "(b t) h d -> b t h d", b=prep["batch_size"])
+    if out_dtype is not None:
+        o = o.to(out_dtype)
+    return o, final_state
+
 
 class HopperChunkKDAFunction(torch.autograd.Function):
     @staticmethod
@@ -49,113 +182,18 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         chunk_indices: torch.IntTensor | None = None,
         num_segments: int = 1,
     ):
-        chunk_size = 64
-        assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
-
-        batch_size, seq_len, num_heads, head_dim = q.shape
-
-        if cu_seqlens is None:
-            cu_seqlens = prepare_uniform_cu_seqlens(batch_size, seq_len, q.device, torch.int32)
-
-        # set batch size to 1 after handling cu_seqlens
-        if batch_size != 1:
-            q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
-
-        # gate preprocessing
-        if use_gate_in_kernel:
-            if safe_gate:
-                assert lower_bound is not None, "lower_bound must be set when use safe_gate"
-            g = kda_gate_chunk_cumsum(
-                g=g,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                scale=RCP_LN2,
-                chunk_size=chunk_size,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                lower_bound=lower_bound,
-            )
-        else:
-            g = chunk_local_cumsum(
-                g=g,
-                chunk_size=chunk_size,
-                scale=RCP_LN2,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-            )
-
-        q_rstd, k_rstd = None, None
-        if use_qk_l2norm_in_kernel:
-            q, q_rstd = l2norm_fwd(q)
-            k, k_rstd = l2norm_fwd(k)
-
-        # reshape to packed [T, H, K] for the C++ kernel
-        packed_seq = batch_size * seq_len
-        q = q.reshape(packed_seq, num_heads, head_dim).contiguous()
-        k = k.reshape(packed_seq, num_heads, head_dim).contiguous()
-        v = v.reshape(packed_seq, num_heads, head_dim).contiguous()
-        g = g.reshape(packed_seq, num_heads, head_dim).contiguous()
-        beta = beta.reshape(packed_seq, num_heads).contiguous()
-
-        # workspace buffer for TMA Store O tensormap
-        sm_count = get_device_sm_count(q.device)
-        workspace_size = sm_count * 128
-        workspace_buffer = _get_cache_buf("hopper_kda_fwd_workspace", workspace_size, q.device)
-
-        # ── ChunkWiseParallel segment-scan setup ─────────────────────────────
-        # When num_segments > 1, the kernel grid is expanded to B*H*N_seg and
-        # each block processes one segment of T/N_seg tokens. Inputs/outputs
-        # for state are reshaped from [N_seq, H, K, V] to [N_seq, N_seg, H, K, V].
-        #
-        # `initial_state` accepted in two shapes:
-        #   - [N_seq, H, K, V]               (legacy / user-facing): seg 0 reads it,
-        #                                    seg ≥ 1 reads zero (emits h_ext for merge)
-        #   - [N_seq, N_seg, H, K, V]        (orchestrator pass 2): used as-is, each
-        #                                    seg reads its own pre-prefixed h_initial
-        #
-        # The o output for seg ≥ 1 is INCORRECT after a pass-1 call alone (its
-        # h-trajectory was not prefixed). The orchestrator
-        # `cula_kda_segment_scan_prefill` runs a second pass with the corrected
-        # per-segment h_initial to produce the right o.
-        num_seqs = cu_seqlens.shape[0] - 1
-        if num_segments > 1:
-            head_dim_v = v.shape[-1]
-            seg_shape = (num_seqs, num_segments, num_heads, head_dim, head_dim_v)
-            if initial_state is not None and initial_state.dim() == 5:
-                assert tuple(initial_state.shape) == seg_shape, (
-                    f"5D initial_state must be {seg_shape}, got {tuple(initial_state.shape)}"
-                )
-                seg_input_state = initial_state.contiguous()
-            else:
-                seg_input_state = torch.zeros(seg_shape, dtype=torch.float32, device=q.device)
-                if initial_state is not None:
-                    seg_input_state[:, 0, ...] = initial_state
-            seg_output_state = torch.zeros(seg_shape, dtype=torch.float32, device=q.device)
-        else:
-            seg_input_state = initial_state
-            seg_output_state = None  # let C++ allocate the legacy [N_seq, H, K, V] shape
-
-        # call the C++ kernel
-        o, final_state = cula_cuda.kda_fwd_prefill(
-            None,  # output_ (auto-allocate)
-            seg_output_state,  # output_state_ (None → C++ allocates legacy shape; tensor → use as-is)
-            q,
-            k,
-            v,
-            seg_input_state,  # input_state_
-            g,  # alpha_
-            beta,  # beta_
-            cu_seqlens,
-            workspace_buffer,
-            scale,
-            safe_gate,
-            num_segments,
+        out_dtype = q.dtype
+        prep = _kda_hopper_prep(
+            q, k, v, g, beta, A_log, dt_bias,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate, lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         )
-
-        # reshape back
-        o = rearrange(o, "(b t) h d -> b t h d", b=batch_size)
-
-        return o.to(q.dtype), final_state
+        return _kda_hopper_call_kernel(
+            prep, scale=scale, safe_gate=safe_gate, num_segments=num_segments,
+            initial_state=initial_state, out_dtype=out_dtype,
+        )
 
     @staticmethod
     @input_guard
@@ -348,37 +386,59 @@ def cula_kda_segment_scan_prefill(
             f"got {num_segments}. N≥3 needs the FLA M-chain merge step."
         )
 
-    # Pass 1: 4D initial_state → forward will expand to [N_seq, 2, H, K, V] with seg 0 = user_init, seg 1 = 0
-    _o_pass1, h_seg = cula_kda_prefill(
-        q=q, k=k, v=v, g=g, beta=beta,
-        scale=scale, initial_state=initial_state,
-        output_final_state=True,  # need h_seg to chain
+    # ── Validation (mirrors cula_kda_prefill's checks) ───────────────────
+    assert_hopper()
+    assert safe_gate, "Only support safe_gate=True."
+    if cu_seqlens is not None and q.shape[0] != 1:
+        raise ValueError(
+            f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+        )
+    if initial_state is not None:
+        assert initial_state.dtype == torch.float32, "initial_state must be in float32."
+    A_log, dt_bias = None, None
+    if use_gate_in_kernel:
+        assert "A_log" in kwargs, "A_log must be provided when use_gate_in_kernel=True."
+        A_log, dt_bias = kwargs["A_log"], kwargs.get("dt_bias")
+        if safe_gate and lower_bound is None:
+            raise ValueError("`lower_bound` must be specified when `safe_gate=True` and `use_gate_in_kernel=True`.")
+    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
+    assert beta.shape == q.shape[:3]
+    assert q.dtype == k.dtype == v.dtype == torch.bfloat16
+    assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+
+    # ── Pass dedup: prep stack runs ONCE (cumsum + l2norm + reshape) ─────
+    # Without this, calling cula_kda_prefill twice would re-run all 3 Triton
+    # launches per pass — confirmed empirically on H100 to leave N_seg=2 at
+    # ratio 0.99x of N_seg=1 because prep duplication offsets grid expansion.
+    out_dtype = q.dtype
+    prep = _kda_hopper_prep(
+        q, k, v, g, beta, A_log, dt_bias,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
         safe_gate=safe_gate, lower_bound=lower_bound,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-        num_segments=2, **kwargs,
     )
-    # h_seg shape: [N_seq, 2, H, K, V]
-    # h_seg[:, 0, ...] = correct h after seg 0  (used as h_initial for seg 1 in pass 2)
-    # h_seg[:, 1, ...] = h_ext_1                (discarded — pass 2 will re-derive properly)
 
-    # Pass 2: build 5D initial_state with corrected per-segment h_initial
+    # ── Pass 1: seg 0 sees real init, seg 1 sees zero (emits h_ext) ──────
+    # 4D initial_state → call_kernel expands to [N_seq, 2, H, K, V]
+    _o_pass1, h_seg = _kda_hopper_call_kernel(
+        prep, scale=scale, safe_gate=safe_gate, num_segments=2,
+        initial_state=initial_state, out_dtype=out_dtype,
+    )
+    # h_seg[:, 0, ...] = M_0 @ user_init + h_ext_0  (correct h after seg 0)
+    # h_seg[:, 1, ...] = h_ext_1                    (seg 1's local; replaced below)
+
+    # ── Pass 2: rebuild input_state with seg 1 ← h after seg 0 ───────────
     pass2_init = torch.zeros_like(h_seg)
     if initial_state is not None:
         pass2_init[:, 0, ...] = initial_state
     pass2_init[:, 1, ...] = h_seg[:, 0, ...]
 
-    o, h_final_seg = cula_kda_prefill(
-        q=q, k=k, v=v, g=g, beta=beta,
-        scale=scale, initial_state=pass2_init,
-        output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        use_gate_in_kernel=use_gate_in_kernel,
-        safe_gate=safe_gate, lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-        num_segments=2, **kwargs,
+    o, h_final_seg = _kda_hopper_call_kernel(
+        prep, scale=scale, safe_gate=safe_gate, num_segments=2,
+        initial_state=pass2_init, out_dtype=out_dtype,
     )
-    # h_final_seg[:, -1, ...] is the h after the entire sequence (seg 1 final)
     final_state = h_final_seg[:, -1, ...] if output_final_state else None
     return o, final_state
