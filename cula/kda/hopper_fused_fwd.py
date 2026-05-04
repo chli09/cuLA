@@ -17,7 +17,7 @@ import torch
 import triton
 from einops import rearrange
 from fla.modules.l2norm import l2norm_fwd
-from fla.ops.cp.chunk_delta_h import pre_process_fwd_kernel_merged
+from fla.ops.cp.chunk_delta_h import merge_fwd_bwd_kernel, pre_process_fwd_kernel_merged
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum
@@ -161,48 +161,49 @@ def _kda_hopper_call_kernel(
     return o, final_state
 
 
-def _kda_extract_all_segment_Ms(
+def _kda_extract_all_segment_ag_hm(
     kg_full: torch.Tensor,    # [B=1, T_packed, H, K] bf16
     u_full: torch.Tensor,     # [B=1, T_packed, H, V] bf16
     w_full: torch.Tensor,     # [B=1, T_packed, H, K] bf16
     gk_full: torch.Tensor,    # [B=1, T_packed, H, K] fp32
     num_segments: int,
+    num_orig_seqs: int = 1,
     *,
     chunk_size: int = CHUNK_SIZE,
 ) -> torch.Tensor:
-    """Compute ALL N segments' transition matrices M in ONE Triton launch.
+    """Compute ALL (num_orig_seqs × num_segments) per-orig-seq segment
+    (h_ext, M) in ONE Triton launch via FLA's pre_process_fwd_kernel_merged
+    (MULTI_SEQS=True path).
 
-    Uses FLA's `pre_process_fwd_kernel_merged` with MULTI_SEQS=True path:
-    cu_seqlens encodes the N segment boundaries (uniform T_per_seg = T/N), the
-    kernel's grid.z = num_segments dispatches one block per segment in
-    parallel.
+    Multi-orig-seq layout (num_orig_seqs > 1, e.g. B=2 input):
+      cu_seqlens = [0, T_seg, 2*T_seg, ..., num_orig_seqs*num_segments * T_seg]
+      where T_seg = T_orig / num_segments  (T_orig = T_packed / num_orig_seqs).
+      Each fused-M block processes one (orig_seq, segment) pair → no segment
+      crosses an orig_seq boundary.
 
-    Returns M ∈ [N, H, K, K] fp32 stacked across segments. Caller indexes
-    M[k] for the k-th segment's transition matrix.
-
-    Replaces the per-segment `pre_process_fwd_kernel_merged` calls (one per
-    M needed). Empirically each per-segment call costs ~200μs of Triton
-    launch overhead on H100; folding N-2 calls into 1 saves ~(N-3) × 200μs
-    on the orchestrator path. For N=16 this is ~2.6ms saved per call, which
-    is the difference between the segment-scan being a wash and a real win.
+    Returns ag_hm ∈ [num_orig_seqs * num_segments, H, K, K+V] fp32, indexed as
+    ag_hm[orig_seq * num_segments + seg, ...]. For each (orig_seq, seg):
+        ag_hm[..., :V]     = h_ext  (with init=0, FLA's WY-decomp result)
+        ag_hm[..., V:V+K]  = M      (transition matrix)
     """
     assert kg_full.shape[0] == 1, "internal: prep tensors are flattened to B=1"
     _B, T_packed, H, K = kg_full.shape
     V = u_full.shape[-1]
-    assert T_packed % num_segments == 0, (
-        f"T_packed={T_packed} must be divisible by num_segments={num_segments}"
+    assert T_packed % (num_orig_seqs * num_segments) == 0, (
+        f"T_packed={T_packed} must be divisible by num_orig_seqs*num_segments="
+        f"{num_orig_seqs * num_segments}"
     )
-    T_seg = T_packed // num_segments
+    T_seg = T_packed // (num_orig_seqs * num_segments)
+    total_segs = num_orig_seqs * num_segments
 
     BK = triton.next_power_of_2(K)
     BLOCK_SIZE = 32 if K <= 64 else 64
-    # cu_seqlens for N uniform segments: [0, T_seg, 2*T_seg, ..., N*T_seg]
-    cu = torch.arange(num_segments + 1, dtype=torch.int32, device=kg_full.device) * T_seg
-    hm = kg_full.new_zeros(num_segments, H, K, V + K, dtype=torch.float32)
+    cu = torch.arange(total_segs + 1, dtype=torch.int32, device=kg_full.device) * T_seg
+    hm = kg_full.new_zeros(total_segs, H, K, V + K, dtype=torch.float32)
     grid = (
         triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE),
         H,
-        num_segments,  # ★ MULTI_SEQS axis
+        total_segs,
     )
     pre_process_fwd_kernel_merged[grid](
         k=kg_full, v=u_full, w=w_full,
@@ -213,35 +214,116 @@ def _kda_extract_all_segment_Ms(
         BT=chunk_size, BK1=BK,
         USE_EXP2=True,
         BLOCK_SIZE=BLOCK_SIZE,
-        MULTI_SEQS=True,  # ★
+        MULTI_SEQS=True,
     )
-    # hm[i, h, :, :V] = h_ext_i  (discarded — cuLA pass-1 already gave us h_ext)
-    # hm[i, h, :, V:V+K] = M_i
-    return hm[:, :, :, V : V + K].contiguous()  # [N, H, K, K]
+    return hm  # [num_orig_seqs * num_segments, H, K, K+V]
+
+
+def _kda_merge_segment_chain_via_fla(
+    ag_hm: torch.Tensor,            # [num_orig_seqs * num_segments, H, K, K+V]
+    initial_state: torch.Tensor | None,  # [num_orig_seqs, H, K, V] or None
+    num_segments: int,
+    num_orig_seqs: int,
+    H: int,
+    K: int,
+    V: int,
+    device: torch.device,
+    skip_first_seg: bool = False,
+) -> torch.Tensor:
+    """FLA's merge_fwd_bwd_kernel chains the affine maps for each orig seq's
+    N segments into per-(orig_seq, segment) h_initial. Multi-orig-seq aware.
+
+    Args:
+        skip_first_seg: when True, each orig seq's chain starts at its
+            local ag_hm[1] (skip ag_hm[0] of that orig seq) and uses
+            ``initial_state[orig_seq]`` as h0. This is the cuLA-consistent
+            path used by the orchestrator (cuLA pass 1 already produced
+            pass2_init[:, 1] = h_seg_pass1[:, 0] cuLA-faithfully).
+
+    Returns ``initial_states_merge`` ∈ [num_orig_seqs * num_writes, H, K, V]
+    where num_writes = num_segments - (2 if skip_first_seg else 1).
+    Layout: orig_seq s's writes occupy slots [s*num_writes, (s+1)*num_writes).
+    """
+    ss_offset = 1 if skip_first_seg else 0
+    num_writes_per_seq = num_segments - 1 - ss_offset
+    assert num_writes_per_seq >= 1, "merge kernel needs at least one write target"
+    total_segs = num_orig_seqs * num_segments
+    assert ag_hm.shape[0] == total_segs and ag_hm.shape[3] == K + V
+
+    # For each orig_seq s, the kernel iterates segments
+    # [s*num_segments + ss_offset, (s+1)*num_segments) of ag_hm.
+    seq_offsets_list = []
+    init_offsets_list = []
+    h0_seq_ids_list = []
+    for s in range(num_orig_seqs):
+        seq_offsets_list.append(s * num_segments + ss_offset)
+        init_offsets_list.append(s * num_writes_per_seq)
+        h0_seq_ids_list.append(s)
+    seq_offsets_list.append(num_orig_seqs * num_segments)  # end sentinel
+    init_offsets_list.append(num_orig_seqs * num_writes_per_seq)  # end sentinel
+
+    seq_offsets = torch.tensor(seq_offsets_list, dtype=torch.int32, device=device)
+    init_offsets = torch.tensor(init_offsets_list, dtype=torch.int32, device=device)
+    h0_seq_ids = torch.tensor(h0_seq_ids_list, dtype=torch.int32, device=device)
+
+    initial_states_merge = ag_hm.new_empty(
+        num_orig_seqs * num_writes_per_seq, H, K, V, dtype=torch.float32,
+    )
+    BK = triton.next_power_of_2(K)
+
+    def grid(meta):
+        return (triton.cdiv(V, meta['BV']), num_orig_seqs, H)
+
+    merge_fwd_bwd_kernel[grid](
+        h=initial_states_merge,
+        ag_hm=ag_hm,
+        pre_or_post_num_ranks=num_orig_seqs,
+        rank=0,
+        seq_offsets=seq_offsets,
+        init_offsets=init_offsets,
+        h0_seq_ids=h0_seq_ids,
+        h0=initial_state,
+        H=H, K=K, V=V,
+        BK=BK,
+        FORWARD=True,
+        INTRACARD_MODE=True,
+        NUM_SEQ_ENTRIES=num_orig_seqs,
+    )
+    return initial_states_merge  # [num_orig_seqs * num_writes_per_seq, H, K, V]
 
 
 def _kda_compute_segment_initial_states(
     prep: dict,
-    h_seg_pass1: torch.Tensor,  # [N_seq, N_seg, H, K, V] from pass 1
+    h_seg_pass1: torch.Tensor,  # [N_seq, N_seg, H, K, V] from cuLA pass 1
     initial_state: torch.Tensor | None,
     num_segments: int,
     safe_gate: bool,
     scale: float,
     chunk_size: int = CHUNK_SIZE,
 ) -> torch.Tensor:
-    """Build the per-segment h_initial array for pass 2.
+    """Build the per-segment h_initial array for cuLA pass 2.
 
-    For num_segments == 2, the merge is trivial (h_seg_pass1[:, 0] is the
-    correct h_initial for seg 1 because pass 1's seg 0 used the real init).
-    For num_segments >= 3, we need transition matrices M_1, ..., M_{N-2} so we
-    can extend the chain past h_seg_pass1[:, 0]:
+    Hybrid design (cuLA-consistent first step + FLA M-chain for the tail):
+        pass2_init[:, 0]      = user_init         (seg 0 starts from user h0)
+        pass2_init[:, 1]      = h_seg_pass1[:, 0]  (cuLA-consistent: M_0 @ h0 + h_ext_0
+                                                    computed by cuLA pass 1)
+        pass2_init[:, 2..N-1] = FLA merge kernel, starting from h_seg_pass1[:, 0],
+                                chaining ag_hm[1..N-1] = (h_ext, M) from FLA fused-M
 
-        h_initial[s] = M_{s-1} @ h_initial[s-1] + h_seg_pass1[:, s-1]   for s >= 2
+    Why hybrid: an earlier full-FLA chain (skip cuLA pass 1, merge from ag_hm[0])
+    gave a ~1.6× speedup but breaks pytest at init_random because FLA's
+    M_0 / h_ext_0 differ slightly from cuLA's, and the M_0 @ h0 product
+    amplifies that difference proportional to ‖h0‖. Keeping pass 1 to bootstrap
+    pass2_init[:, 1] cuLA-consistently fixes the init_random failure.
 
-    M_k is computed by running FLA's chunk_kda_fwd_intra on the packed prep
-    tensors to recover (w, u, kg), then calling pre_process_fwd_kernel_merged
-    on each segment's slice. Adds 1 + (N-2) Triton launches but no kernel work
-    that scales with T per pass.
+    Pipeline (per call):
+      1. FLA chunk_kda_fwd_intra ~95μs           (recover w, u, kg)
+      2. _kda_extract_all_segment_ag_hm ~40μs    (fused-M, all N segs in 1 launch)
+      3. _kda_merge_segment_chain_via_fla ~50μs  (1 launch, replaces host fold)
+      4. zero-fill + index assignment            (host, ~negligible)
+
+    For num_segments == 2, the merge is trivial (no M needed, no FLA intra
+    call needed) — pass2_init[:, 1] = h_seg_pass1[:, 0] suffices.
     """
     num_seqs = prep["num_seqs"]
     num_heads = prep["num_heads"]
@@ -255,18 +337,12 @@ def _kda_compute_segment_initial_states(
     )
     if initial_state is not None:
         pass2_init[:, 0, ...] = initial_state
-    pass2_init[:, 1, ...] = h_seg_pass1[:, 0, ...]  # = M_0 @ user_init + h_ext_0
+    pass2_init[:, 1, ...] = h_seg_pass1[:, 0, ...]  # cuLA-consistent
 
     if num_segments == 2:
-        return pass2_init
+        return pass2_init  # trivial case
 
-    # For N >= 3: we need M_1, M_2, ..., M_{N-2}. Run FLA intra ONCE to
-    # recover (w, u, kg) consistent with FLA's reference recurrence, then
-    # ONE batched M-kernel call (MULTI_SEQS=True) to get all M's in parallel.
-    #
-    # Note: FLA's chunk_kda_fwd_intra expects [B, T, H, D] shape; our prep
-    # tensors are packed [packed_seq, H, D]. With B=1 (always after prep),
-    # we just unsqueeze(0).
+    # FLA chunk_kda_fwd_intra: prep tensors are packed [packed_seq, H, D] with B=1.
     q4 = prep["q"].unsqueeze(0)
     k4 = prep["k"].unsqueeze(0)
     v4 = prep["v"].unsqueeze(0)
@@ -278,24 +354,41 @@ def _kda_compute_segment_initial_states(
     )
 
     T_packed = q4.shape[1]
-    assert T_packed % num_segments == 0, (
-        f"non-uniform segment length not yet supported for num_segments>=3 "
-        f"(packed_seq={T_packed}, num_segments={num_segments})"
+    assert T_packed % (num_seqs * num_segments) == 0, (
+        f"non-uniform segment length not yet supported "
+        f"(packed_seq={T_packed}, num_seqs={num_seqs}, num_segments={num_segments})"
     )
 
-    # ★ ONE batched M-kernel launch for all N segments instead of N-2 separate calls.
-    all_Ms = _kda_extract_all_segment_Ms(
+    # ag_hm[num_seqs * num_segments, H, K, K+V] — fused-M for ALL (orig_seq, seg) pairs.
+    ag_hm = _kda_extract_all_segment_ag_hm(
         kg_full=kg_full, u_full=u_full, w_full=w_full, gk_full=g4,
-        num_segments=num_segments, chunk_size=chunk_size,
-    )  # [N, H, K, K]
+        num_segments=num_segments, num_orig_seqs=num_seqs, chunk_size=chunk_size,
+    )
 
-    # Host-side affine fold: h_init[s] = M_{s-1} @ h_init[s-1] + h_seg_pass1[:, s-1]
-    # We need M_1..M_{N-2} (M_0 captured implicitly in h_seg_pass1[:, 0];
-    # M_{N-1} unused, never extends past the last segment).
-    for s in range(2, num_segments):
-        M_k = all_Ms[s - 1]  # [H, K, K]
-        chained = torch.einsum('hki,nhiv->nhkv', M_k, pass2_init[:, s - 1, ...])
-        pass2_init[:, s, ...] = chained + h_seg_pass1[:, s - 1, ...]
+    # ★ Overwrite FLA's h_ext (for seg ≥ 1, every orig seq) with cuLA's h_ext
+    # from h_seg_pass1[s, k] (= M_k @ 0 + h_ext_k, since cuLA pass 1 ran segs
+    # ≥ 1 with init=0). Keeps the merge chain cuLA-consistent on h_ext while
+    # using FLA-derived M.
+    ag_hm_view = ag_hm.view(num_seqs, num_segments, num_heads, head_dim, head_dim_v + head_dim)
+    ag_hm_view[:, 1:, :, :, :head_dim_v] = h_seg_pass1[:, 1:, :, :, :]
+
+    # FLA merge kernel: per orig seq, skip its ag_hm[seg=0], use h_seg_pass1[s, 0]
+    # as h0. Output: initial_states_merge[s * (N_seg-2) + k] = h_initial for
+    # orig_seq s's segment k+2.
+    initial_states_merge = _kda_merge_segment_chain_via_fla(
+        ag_hm=ag_hm,
+        initial_state=h_seg_pass1[:, 0, ...].contiguous(),  # [num_seqs, H, K, V]
+        num_segments=num_segments,
+        num_orig_seqs=num_seqs,
+        H=num_heads, K=head_dim, V=head_dim_v,
+        device=device,
+        skip_first_seg=True,
+    )  # [num_seqs * (N_seg - 2), H, K, V]
+
+    # Reshape to [num_seqs, N_seg-2, H, K, V] and assign to pass2_init[:, 2:].
+    pass2_init[:, 2:, ...] = initial_states_merge.view(
+        num_seqs, num_segments - 2, num_heads, head_dim, head_dim_v,
+    )
     return pass2_init
 
 
@@ -549,7 +642,20 @@ def cula_kda_segment_scan_prefill(
     if scale is None:
         scale = q.shape[-1] ** -0.5
 
-    # ── Pass dedup: prep stack runs ONCE (cumsum + l2norm + reshape) ─────
+    # ── 2-pass hybrid design (post 2026-05-04 nsys + correctness findings) ──
+    # Pass 1 keeps cuLA-consistent h_seg_pass1[:, 0] = M_0 @ user_init + h_ext_0
+    # for the first chain step (full-FLA path here breaks tol on init_random).
+    # FLA merge kernel handles segs 2..N-1 in one launch — replaces the host
+    # Python fold loop that was costing ~30μs per fold step (= ~1ms+ at N=16).
+    #
+    # Pipeline (per call, segment-scan path):
+    #   1. prep                     cumsum + l2norm × 2 + reshape
+    #   2. cuLA pass 1              [user_init, 0, 0, ...] → h_seg_pass1[:, k]
+    #   3. FLA intra (N≥3)          recover (w, u, kg)
+    #   4. fused-M kernel (N≥3)     ag_hm[N, H, K, K+V] = (h_ext, M) all in 1 launch
+    #   5. FLA merge kernel (N≥3)   skip seg 0, chain ag_hm[1..N-1] from h_seg_pass1[:, 0]
+    #                                → produces pass2_init[:, 2..N-1]
+    #   6. cuLA pass 2              corrected per-segment init → final o + h_final
     out_dtype = q.dtype
     prep = _kda_hopper_prep(
         q, k, v, g, beta, A_log, dt_bias,
@@ -559,22 +665,19 @@ def cula_kda_segment_scan_prefill(
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
     )
 
-    # ── Pass 1: seg 0 sees real init; seg ≥ 1 sees zero (emits h_ext) ────
-    # 4D initial_state → call_kernel expands to [N_seq, num_segments, H, K, V]
+    # Pass 1: seg 0 sees user_init, seg ≥ 1 sees zero (emits h_ext locally).
     _o_pass1, h_seg = _kda_hopper_call_kernel(
         prep, scale=scale, safe_gate=safe_gate, num_segments=num_segments,
         initial_state=initial_state, out_dtype=out_dtype,
     )
-    # h_seg[:, 0]    = M_0 @ user_init + h_ext_0  (correct h after seg 0)
-    # h_seg[:, k≥1]  = h_ext_k                    (local with init=0)
 
-    # ── M-chain merge: build per-segment prefixed h_initial for pass 2 ───
+    # Build per-segment prefixed init via FLA merge kernel (skipping seg 0).
     pass2_init = _kda_compute_segment_initial_states(
         prep=prep, h_seg_pass1=h_seg, initial_state=initial_state,
         num_segments=num_segments, safe_gate=safe_gate, scale=scale,
     )
 
-    # ── Pass 2: kernel with corrected per-segment init → correct o output ─
+    # Pass 2: cuLA kernel with corrected per-segment init.
     o, h_final_seg = _kda_hopper_call_kernel(
         prep, scale=scale, safe_gate=safe_gate, num_segments=num_segments,
         initial_state=pass2_init, out_dtype=out_dtype,
