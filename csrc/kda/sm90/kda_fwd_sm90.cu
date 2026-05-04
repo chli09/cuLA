@@ -106,17 +106,23 @@ launch_kda_fwd_prefill_kernel(
         scale,                                                                                         \
         sm_count)
 
-#define LAUNCH(needs_beta, needs_alpha, init_state, safe_gate)                                                       \
-    do {                                                                                                             \
-        if (num_segments == 1) {                                                                                     \
-            LAUNCH_NSEG(1, needs_beta, needs_alpha, init_state, safe_gate);                                          \
-        } else if (num_segments == 2) {                                                                              \
-            LAUNCH_NSEG(2, needs_beta, needs_alpha, init_state, safe_gate);                                          \
-        } else if (num_segments == 4) {                                                                              \
-            LAUNCH_NSEG(4, needs_beta, needs_alpha, init_state, safe_gate);                                          \
-        } else {                                                                                                     \
-            throw std::runtime_error("unsupported num_segments (only {1, 2, 4} compiled): " + std::to_string(num_segments)); \
-        }                                                                                                            \
+#define LAUNCH(needs_beta, needs_alpha, init_state, safe_gate)                                                                  \
+    do {                                                                                                                        \
+        if (num_segments == 1) {                                                                                                \
+            LAUNCH_NSEG(1, needs_beta, needs_alpha, init_state, safe_gate);                                                     \
+        } else if (num_segments == 2) {                                                                                         \
+            LAUNCH_NSEG(2, needs_beta, needs_alpha, init_state, safe_gate);                                                     \
+        } else if (num_segments == 4) {                                                                                         \
+            LAUNCH_NSEG(4, needs_beta, needs_alpha, init_state, safe_gate);                                                     \
+        } else if (num_segments == 8) {                                                                                         \
+            LAUNCH_NSEG(8, needs_beta, needs_alpha, init_state, safe_gate);                                                     \
+        } else if (num_segments == 16) {                                                                                        \
+            LAUNCH_NSEG(16, needs_beta, needs_alpha, init_state, safe_gate);                                                    \
+        } else if (num_segments == 32) {                                                                                        \
+            LAUNCH_NSEG(32, needs_beta, needs_alpha, init_state, safe_gate);                                                    \
+        } else {                                                                                                                \
+            throw std::runtime_error("unsupported num_segments (only {1, 2, 4, 8, 16, 32} compiled): " + std::to_string(num_segments)); \
+        }                                                                                                                       \
     } while (0)
 
     if (init_state) {

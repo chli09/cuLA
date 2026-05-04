@@ -25,17 +25,18 @@ pytestmark = pytest.mark.sm90_only
 
 
 # T must be divisible by chunk_size * num_segments. Largest tested num_segments
-# is 4 → require T % (64 * 4) = T % 256 == 0.
+# is 32 → for those, require T % (64 * 32) = T % 2048 == 0.
+# Each shape is filtered to only the N values that satisfy this divisibility.
 SHAPES = [
-    pytest.param(1, 4, 256, id="B1-H4-T256"),       # smallest sane (T/N_seg = 64 = 1 chunk @ N=4)
-    pytest.param(1, 4, 1024, id="B1-H4-T1024"),     # mid
-    pytest.param(1, 4, 8192, id="B1-H4-T8192"),     # PR1 worst-case shape (cuLA loses 0.52x to FLA)
-    pytest.param(1, 8, 2048, id="B1-H8-T2048"),     # slightly more heads
-    pytest.param(2, 4, 1024, id="B2-H4-T1024"),     # B>1 path (internal batch flatten)
+    pytest.param(1, 4, 256, id="B1-H4-T256"),       # only fits N≤4
+    pytest.param(1, 4, 1024, id="B1-H4-T1024"),     # only fits N≤16
+    pytest.param(1, 4, 8192, id="B1-H4-T8192"),     # PR1 worst-case shape, fits all N
+    pytest.param(1, 8, 2048, id="B1-H8-T2048"),     # fits N≤32
+    pytest.param(2, 4, 1024, id="B2-H4-T1024"),     # B>1 path
 ]
 
 
-@pytest.mark.parametrize("num_segments", [2, 4], ids=["N2", "N4"])
+@pytest.mark.parametrize("num_segments", [2, 4, 8, 16, 32], ids=["N2", "N4", "N8", "N16", "N32"])
 @pytest.mark.parametrize("B,H,T", SHAPES)
 @pytest.mark.parametrize("with_init_state", [False, True], ids=["init_zero", "init_random"])
 def test_segment_scan_n2_matches_single_pass(B: int, H: int, T: int, with_init_state: bool, num_segments: int):
@@ -43,9 +44,8 @@ def test_segment_scan_n2_matches_single_pass(B: int, H: int, T: int, with_init_s
     for each supported num_segments value."""
     D = 128
     chunk_size = 64
-    assert T % (chunk_size * num_segments) == 0, (
-        f"T={T} not divisible by chunk_size*N_seg={chunk_size * num_segments}"
-    )
+    if T % (chunk_size * num_segments) != 0:
+        pytest.skip(f"T={T} not divisible by chunk_size*N_seg={chunk_size * num_segments}")
 
     torch.manual_seed(0)
     q = torch.rand(B, T, H, D, dtype=torch.bfloat16, device=device)
