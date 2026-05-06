@@ -29,6 +29,60 @@ from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepa
 
 CHUNK_SIZE = 64
 
+# Valid C++ template instantiations for num_segments (see kda_fwd_sm90_safe_gate.cu).
+_VALID_N_SEGS = (1, 2, 4, 8, 16, 32)
+
+
+def auto_num_segments(
+    num_seqs: int,
+    num_heads: int,
+    seq_len: int,
+    sm_count: int,
+    chunk_size: int = CHUNK_SIZE,
+) -> int:
+    """Pick ``num_segments`` to bring the kernel grid close to ``sm_count``.
+
+    The single-pass Hopper-fused kernel launches with grid ``= num_seqs * num_heads``,
+    which underfills the SM array for small B/H. Segment-scan multiplies grid by N
+    along the T axis (grid = num_seqs * num_heads * N). This heuristic picks the
+    smallest N ∈ {1, 2, 4, 8, 16, 32} whose grid covers ``sm_count`` while
+    satisfying the kernel's structural constraints.
+
+    Constraints applied (in order):
+      1. N ∈ {1, 2, 4, 8, 16, 32} — matches the C++ template instantiations.
+      2. seq_len % N == 0 — uniform-segment requirement.
+      3. seq_len // N ≥ 2 * chunk_size — at least 2 chunks per segment;
+         shorter segments make the per-segment overhead (FLA intra + fused-M +
+         merge + 2nd cuLA pass) dominate.
+      4. seq_len ≥ 64 * chunk_size (= 4096) — segment-scan has a ~1 ms
+         fixed-cost floor (prep + FLA intra + fused-M + merge + 2nd cuLA pass).
+         Calibrated empirically on H100 NVL: at T = 2048 with N ∈ {8, 16},
+         segment-scan regresses 28–31 % vs N = 1 even at small grid (B = 1,
+         H = 4..16). At T = 4096 it crosses break-even and starts winning.
+         Returns N = 1 here regardless of base_grid.
+      5. 3 * base_grid ≥ sm_count — when the legacy grid already fills at
+         least 1/3 of the SMs, segment-scan's fixed cost (~1 ms) eats more
+         than the grid-doubling/quadrupling can recover. Empirical
+         calibration: grid=64 + N=2 on H100 (132 SMs) regresses 10–20% vs
+         N=1, even though base_grid*N hits sm_count. Returns N = 1 here.
+
+    Returns the chosen N. N == 1 means "fall back to single-pass cula_kda_prefill".
+    """
+    base_grid = num_seqs * num_heads
+    if 3 * base_grid >= sm_count:
+        return 1                                         # ≥ 1/3-filled; segment-scan overhead > grid-expansion gain
+    if seq_len < 64 * chunk_size:
+        return 1                                         # below segment-scan break-even (~4096)
+    desired = sm_count / base_grid                       # target multiplier
+    # Round to nearest power of 2, clamped to valid set.
+    # log2(desired): N=1 if desired<1.5, N=2 if 1.5≤desired<3, etc.
+    import math
+    cand = 1 << max(0, min(5, round(math.log2(desired))))
+    # Tighten by T-divisibility / per-segment-chunk requirements.
+    while cand > 1 and (seq_len % cand != 0 or seq_len // cand < 2 * chunk_size):
+        cand //= 2
+    return cand
+
 
 def _kda_hopper_prep(
     q: torch.Tensor,
@@ -570,7 +624,7 @@ def cula_kda_segment_scan_prefill(
     lower_bound: float | None = None,
     cu_seqlens: torch.IntTensor | None = None,
     chunk_indices: torch.IntTensor | None = None,
-    num_segments: int = 2,
+    num_segments: int | str = 2,
     **kwargs,
 ):
     r"""
@@ -580,6 +634,11 @@ def cula_kda_segment_scan_prefill(
     items, expanding the kernel grid from B*H to B*H*N_seg. Targets the
     small-B/H + long-T regime where the legacy single-pass kernel is grid-
     underfilled (e.g. B=1, H=4 → grid 4, vs 132 SMs on GH200).
+
+    ``num_segments`` accepts an integer in ``{1, 2, 4, 8, 16, 32}``, or the
+    string ``"auto"`` to let :func:`auto_num_segments` pick the value that
+    best saturates the SM array given (num_seqs, num_heads, seq_len) and
+    the device's SM count.
 
     Two-pass implementation (for num_segments == 2):
 
@@ -603,6 +662,40 @@ def cula_kda_segment_scan_prefill(
 
     Args / behavior otherwise identical to ``cula_kda_prefill``.
     """
+    # Resolve "auto" sentinel before any validation. We need num_seqs / seq_len /
+    # num_heads — derive from raw inputs without doing the full prep yet.
+    if isinstance(num_segments, str):
+        if num_segments != "auto":
+            raise ValueError(
+                f"num_segments must be int or the literal string 'auto', got {num_segments!r}."
+            )
+        # num_seqs: from cu_seqlens if varlen, else B (q.shape[0]); num_heads: q.shape[2].
+        # T_per_seq: q.shape[1] for fixed; for varlen we require uniform (matches the
+        # T_packed % (num_seqs * num_segments) constraint deeper in this function).
+        if cu_seqlens is None:
+            num_seqs_resolved = q.shape[0]
+            T_per_seq = q.shape[1]
+        else:
+            # cu_seqlens shape [N+1]; segments must be uniform for segment-scan.
+            num_seqs_resolved = int(cu_seqlens.shape[0]) - 1
+            T_packed = q.shape[1]                         # q is (1, T_packed, ...) for varlen
+            if T_packed % num_seqs_resolved != 0:
+                # Non-uniform varlen — segment-scan can't apply. Fall back to N=1.
+                num_segments = 1
+                T_per_seq = T_packed
+            else:
+                T_per_seq = T_packed // num_seqs_resolved
+        num_heads_resolved = q.shape[2]
+        if isinstance(num_segments, str):                 # still "auto"
+            sm_count = get_device_sm_count(q.device)
+            num_segments = auto_num_segments(
+                num_seqs=num_seqs_resolved,
+                num_heads=num_heads_resolved,
+                seq_len=T_per_seq,
+                sm_count=sm_count,
+                chunk_size=CHUNK_SIZE,
+            )
+
     if num_segments == 1:
         return cula_kda_prefill(
             q=q, k=k, v=v, g=g, beta=beta,
@@ -614,9 +707,9 @@ def cula_kda_segment_scan_prefill(
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
             num_segments=1, **kwargs,
         )
-    if num_segments not in (2, 4, 8, 16, 32):
+    if num_segments not in _VALID_N_SEGS:
         raise NotImplementedError(
-            f"cula_kda_segment_scan_prefill currently supports num_segments ∈ {{1, 2, 4, 8, 16, 32}} "
+            f"cula_kda_segment_scan_prefill currently supports num_segments ∈ {set(_VALID_N_SEGS)} "
             f"(matching the C++ template instantiations), got {num_segments}."
         )
 

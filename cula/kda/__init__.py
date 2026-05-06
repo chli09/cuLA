@@ -13,11 +13,13 @@
 # limitations under the License.
 
 from cula.kda.chunk import chunk_kda
+from cula.kda.hopper_fused_fwd import auto_num_segments
 from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
 from cula.kda.hopper_fused_fwd import cula_kda_segment_scan_prefill as kda_segment_scan_prefill_hopper
 from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
 
 __all__ = [
+    "auto_num_segments",
     "chunk_kda",
     "kda_decode",
     "fused_sigmoid_gating_delta_rule_update",
