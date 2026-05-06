@@ -297,23 +297,65 @@ def _kda_merge_segment_chain_via_fla(
     Returns ``initial_states_merge`` ∈ [num_orig_seqs * num_writes, H, K, V]
     where num_writes = num_segments - (2 if skip_first_seg else 1).
     Layout: orig_seq s's writes occupy slots [s*num_writes, (s+1)*num_writes).
+
+    Implementation note: FLA's ``merge_fwd_bwd_kernel`` requires *gap-less*
+    seq packing — for adjacent seqs i and i+1, ``seq_offsets[i+1]`` is BOTH
+    seq i's exclusive end AND seq i+1's inclusive start, so they must be the
+    same value. cuLA's natural ``ag_hm`` layout has seq i occupying slots
+    ``[i*N, (i+1)*N)`` contiguously. With ``skip_first_seg=True``, the
+    orchestrator wants seq i to skip its own seg 0 (slot ``i*N``) — but the
+    kernel layout does not allow per-seq gaps. To remove the off-by-one
+    (``ss_end[i]`` would otherwise overshoot into seq i+1's seg 0), we
+    **pre-pack** ag_hm to exclude seg 0 of every orig seq before calling
+    the kernel. The repacked tensor has shape
+    ``[num_orig_seqs * (N-1), H, K, V+K]`` and seq i occupies slots
+    ``[i*(N-1), (i+1)*(N-1))`` — gap-less.
     """
-    ss_offset = 1 if skip_first_seg else 0
-    num_writes_per_seq = num_segments - 1 - ss_offset
-    assert num_writes_per_seq >= 1, "merge kernel needs at least one write target"
     total_segs = num_orig_seqs * num_segments
     assert ag_hm.shape[0] == total_segs and ag_hm.shape[3] == K + V
 
-    # For each orig_seq s, the kernel iterates segments
-    # [s*num_segments + ss_offset, (s+1)*num_segments) of ag_hm.
+    if skip_first_seg and num_orig_seqs > 1:
+        # Pre-pack: drop seg 0 of each orig_seq so seq boundaries are gap-less.
+        # Required because FLA's merge kernel uses a single seq_offsets array
+        # where seq i's end == seq i+1's start (no gap allowed). With
+        # num_orig_seqs > 1 and skip_first_seg=True, the natural cuLA layout
+        # leaves a gap of 1 slot at each seq boundary, which the kernel cannot
+        # express — so seq i's iteration overruns into seq i+1's seg 0,
+        # corrupting numerics.
+        # For num_orig_seqs == 1 we keep the original zero-copy path: seg 0 is
+        # at index 0 and ss_offset=1 simply skips it; there's no next seq to
+        # collide with.
+        ag_hm_view = ag_hm.view(num_orig_seqs, num_segments, H, K, V + K)
+        ag_hm_eff = ag_hm_view[:, 1:, ...].contiguous().view(
+            num_orig_seqs * (num_segments - 1), H, K, V + K
+        )
+        seg_per_seq_eff = num_segments - 1
+        ss_offset_eff = 0
+        # Each seq runs N-1 iterations; the final iteration is not stored
+        # (it's the post-final-seg state, == the seq's final h, not pass2 input).
+        num_writes_per_seq = (num_segments - 1) - 1  # = N - 2
+    else:
+        # Single-seq or no-skip: use ag_hm as-is, no copy.
+        ag_hm_eff = ag_hm
+        seg_per_seq_eff = num_segments
+        ss_offset_eff = 1 if skip_first_seg else 0
+        num_writes_per_seq = num_segments - 1 - ss_offset_eff
+    assert num_writes_per_seq >= 1, "merge kernel needs at least one write target"
+
+    # Build seq_offsets / init_offsets / h0_seq_ids over the (possibly
+    # pre-packed) ag_hm_eff. Layout:
+    #   - num_orig_seqs > 1 + skip_first_seg: ag_hm_eff is pre-packed, seq i
+    #     occupies [i*(N-1), (i+1)*(N-1)) gap-less. ss_offset_eff = 0.
+    #   - num_orig_seqs == 1: ag_hm_eff is the original ag_hm; seq 0 occupies
+    #     [0, N), and ss_offset_eff in {0, 1} chooses whether to skip seg 0.
     seq_offsets_list = []
     init_offsets_list = []
     h0_seq_ids_list = []
     for s in range(num_orig_seqs):
-        seq_offsets_list.append(s * num_segments + ss_offset)
+        seq_offsets_list.append(s * seg_per_seq_eff + ss_offset_eff)
         init_offsets_list.append(s * num_writes_per_seq)
         h0_seq_ids_list.append(s)
-    seq_offsets_list.append(num_orig_seqs * num_segments)  # end sentinel
+    seq_offsets_list.append(num_orig_seqs * seg_per_seq_eff)  # end sentinel
     init_offsets_list.append(num_orig_seqs * num_writes_per_seq)  # end sentinel
 
     seq_offsets = torch.tensor(seq_offsets_list, dtype=torch.int32, device=device)
@@ -330,7 +372,7 @@ def _kda_merge_segment_chain_via_fla(
 
     merge_fwd_bwd_kernel[grid](
         h=initial_states_merge,
-        ag_hm=ag_hm,
+        ag_hm=ag_hm_eff,
         pre_or_post_num_ranks=num_orig_seqs,
         rank=0,
         seq_offsets=seq_offsets,
