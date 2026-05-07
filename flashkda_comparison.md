@@ -152,7 +152,29 @@ o 的并行轴      chunk-parallel (NT in grid)    chunk-serial (在 K2 内 NT-l
 
 ---
 
-## 4. H20 Benchmarks (FlashKDA vs fla_chunk_kda)
+## 4a. ★ GH200 3-way baseline (cuLA vs FlashKDA vs FLA Triton) — 2026-05-07
+
+测于 Nautilus GH200 pod，B=1 H=变化 T=8192 (issue #11 worst-case 区域)。详见 `cuLA-profiling/2026-05-07_three_way_baseline_gh200.md`。
+
+| B | T | H | cuLA fused | FlashKDA | FLA Triton | 赢家 |
+|---|---|---|-----------:|---------:|-----------:|------|
+| 1 |  8192 |  **4** | 1.491 ms | 0.847 ms | **0.761 ms** | **Triton** ★ |
+| 1 |  8192 | **16** | 1.571 ms | 0.929 ms | **0.768 ms** | **Triton** ★ |
+| 1 |  8192 | 64 | 1.780 ms | **1.239 ms** | 1.868 ms | FlashKDA |
+| 1 |  8192 | 96 | 1.944 ms | **1.454 ms** | 2.829 ms | FlashKDA |
+| 8 |  2048 | 16 | 0.661 ms | **0.436 ms** | 0.994 ms | FlashKDA |
+
+**核心发现 (在前几轮分析里没明文意识到的)：**
+
+1. **FlashKDA 在 H≤16 上输给 FLA Triton**。Kimi 没测这个 regime（H20 bench 全是 H=64/96），所以他们的 1.85-2.31× 加速宣称在小 B/H 上不成立。
+
+2. **issue #11 worst case 的真实对手是 Triton，不是 FlashKDA**。cuLA = 1.49ms vs Triton = 0.76ms = **1.96× 落后**（之前 PR1 估的 0.46× 是 vs Triton，跟这里一致）。
+
+3. **存在一个"全空白"的优化窗口**：在 B=1 H=4 上击败 Triton。FlashKDA 没做、Triton 自己也没专门做。架构上需要 **FlashKDA-style K1（chunk-parallel preprocessing） + FLA chunk-mode o-kernel（chunk-parallel o）的组合**——neither 现有方案有这个。
+
+4. cuLA Hopper fused 在所有 config 上都垫底——**架构问题，不是低层调优问题**。
+
+## 4b. H20 Benchmarks (FlashKDA vs fla_chunk_kda) — 来自 Kimi BENCHMARK_H20.md
 
 来源: `BENCHMARK_H20.md`, 2026-04-22 generated。
 Settings: warmup=30, iters=200, repeats=5。
