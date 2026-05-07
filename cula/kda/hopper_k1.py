@@ -293,6 +293,366 @@ def kda_k1_mqk(
     return ws_mqk
 
 
+@triton.jit
+def kda_k1_inv_kernel(
+    k_ptr,           # [packed_seq, H, K] bf16 (post-l2norm)
+    g_ptr,           # [packed_seq, H, K] fp32 (post-cumsum)
+    beta_ptr,        # [packed_seq, H]    fp32 (post-sigmoid, in [0, 1])
+    ws_inv_ptr,      # [total_NT, H, BT, BT] bf16  ← (I - tril_strict(beta·k·k^T·decay))^-1
+    cu_seqlens,
+    chunk_indices,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,   # 64
+    BC: tl.constexpr,   # 16
+    BK: tl.constexpr,   # 32
+):
+    """Compute the delta-rule inverse INV = (I - L)^-1 per chunk×head.
+
+    L is strict lower triangular 64×64 with:
+        L[i, j] = beta_i · sum_k k[i,k] · k[j,k] · exp2(g[i,k] - g[j,k])  for i > j
+
+    Computed in two phases:
+    1. Per-K-tile loop: accumulate the 10 lower-tri sub-blocks of L (BC=16 each)
+       using the same anchor-decay trick as Mqk (q replaced by k_decayed).
+    2. Apply beta_i row-scaling, then block-LU fwd-substitution to invert.
+    """
+    pid_t = tl.program_id(0).to(tl.int32)
+    pid_h = tl.program_id(1).to(tl.int32)
+
+    i_n = tl.load(chunk_indices + pid_t * 2).to(tl.int32)
+    i_t_local = tl.load(chunk_indices + pid_t * 2 + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    T_seq = eos - bos
+
+    chunk_start_local = i_t_local * BT
+    if chunk_start_local >= T_seq:
+        return
+    actual_len = tl.minimum(BT, T_seq - chunk_start_local)
+    global_chunk_start = bos + chunk_start_local
+
+    o_t = tl.arange(0, BT)
+    o_c = tl.arange(0, BC)
+
+    sc0, sc1, sc2, sc3 = 0, BC, 2 * BC, 3 * BC
+    m_sc0 = (sc0 + o_c) < actual_len
+    m_sc1 = (sc1 + o_c) < actual_len
+    m_sc2 = (sc2 + o_c) < actual_len
+    m_sc3 = (sc3 + o_c) < actual_len
+
+    k_base = k_ptr + (bos * H + pid_h) * K
+    g_base = g_ptr + (bos * H + pid_h) * K
+
+    # 10 lower-tri sub-block accumulators of L (pre-beta)
+    b_L00 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L10 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L11 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L20 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L21 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L22 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L30 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L31 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L32 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_L33 = tl.zeros([BC, BC], dtype=tl.float32)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        offsets_k = i_k * BK + tl.arange(0, BK)
+        m_k = offsets_k < K
+
+        b_k0 = tl.load(tl.make_block_ptr(k_base, shape=(T_seq, K), strides=(H * K, 1),
+            offsets=(chunk_start_local + sc0, i_k * BK), block_shape=(BC, BK), order=(1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_k1 = tl.load(tl.make_block_ptr(k_base, shape=(T_seq, K), strides=(H * K, 1),
+            offsets=(chunk_start_local + sc1, i_k * BK), block_shape=(BC, BK), order=(1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_k2 = tl.load(tl.make_block_ptr(k_base, shape=(T_seq, K), strides=(H * K, 1),
+            offsets=(chunk_start_local + sc2, i_k * BK), block_shape=(BC, BK), order=(1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_k3 = tl.load(tl.make_block_ptr(k_base, shape=(T_seq, K), strides=(H * K, 1),
+            offsets=(chunk_start_local + sc3, i_k * BK), block_shape=(BC, BK), order=(1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_g0 = tl.load(tl.make_block_ptr(g_base, shape=(T_seq, K), strides=(H * K, 1),
+            offsets=(chunk_start_local + sc0, i_k * BK), block_shape=(BC, BK), order=(1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_g1 = tl.load(tl.make_block_ptr(g_base, shape=(T_seq, K), strides=(H * K, 1),
+            offsets=(chunk_start_local + sc1, i_k * BK), block_shape=(BC, BK), order=(1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_g2 = tl.load(tl.make_block_ptr(g_base, shape=(T_seq, K), strides=(H * K, 1),
+            offsets=(chunk_start_local + sc2, i_k * BK), block_shape=(BC, BK), order=(1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_g3 = tl.load(tl.make_block_ptr(g_base, shape=(T_seq, K), strides=(H * K, 1),
+            offsets=(chunk_start_local + sc3, i_k * BK), block_shape=(BC, BK), order=(1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+
+        b_ga0 = tl.load(g_ptr + ((global_chunk_start + sc0) * H + pid_h) * K + offsets_k,
+                        mask=m_k, other=0.0).to(tl.float32)
+        b_ga1 = tl.load(g_ptr + ((global_chunk_start + sc1) * H + pid_h) * K + offsets_k,
+                        mask=m_k, other=0.0).to(tl.float32)
+        b_ga2 = tl.load(g_ptr + ((global_chunk_start + sc2) * H + pid_h) * K + offsets_k,
+                        mask=m_k, other=0.0).to(tl.float32)
+        b_ga3 = tl.load(g_ptr + ((global_chunk_start + sc3) * H + pid_h) * K + offsets_k,
+                        mask=m_k, other=0.0).to(tl.float32)
+
+        # k decayed at sub-chunk a's anchor (rows in sub-chunk a)
+        b_ka0 = b_k0 * exp2(b_g0 - b_ga0[None, :])
+        b_ka1 = b_k1 * exp2(b_g1 - b_ga1[None, :])
+        b_ka2 = b_k2 * exp2(b_g2 - b_ga2[None, :])
+        b_ka3 = b_k3 * exp2(b_g3 - b_ga3[None, :])
+
+        # Diagonal blocks
+        b_ka0_T = b_k0 * exp2(b_ga0[None, :] - b_g0)
+        b_ka1_T = b_k1 * exp2(b_ga1[None, :] - b_g1)
+        b_ka2_T = b_k2 * exp2(b_ga2[None, :] - b_g2)
+        b_ka3_T = b_k3 * exp2(b_ga3[None, :] - b_g3)
+        b_L00 += tl.dot(b_ka0.to(tl.bfloat16), tl.trans(b_ka0_T).to(tl.bfloat16))
+        b_L11 += tl.dot(b_ka1.to(tl.bfloat16), tl.trans(b_ka1_T).to(tl.bfloat16))
+        b_L22 += tl.dot(b_ka2.to(tl.bfloat16), tl.trans(b_ka2_T).to(tl.bfloat16))
+        b_L33 += tl.dot(b_ka3.to(tl.bfloat16), tl.trans(b_ka3_T).to(tl.bfloat16))
+
+        # Off-diagonal: (a, b) with a > b, anchor at a
+        b_kb0_at_a1 = b_k0 * exp2(b_ga1[None, :] - b_g0)
+        b_L10 += tl.dot(b_ka1.to(tl.bfloat16), tl.trans(b_kb0_at_a1).to(tl.bfloat16))
+        b_kb0_at_a2 = b_k0 * exp2(b_ga2[None, :] - b_g0)
+        b_kb1_at_a2 = b_k1 * exp2(b_ga2[None, :] - b_g1)
+        b_L20 += tl.dot(b_ka2.to(tl.bfloat16), tl.trans(b_kb0_at_a2).to(tl.bfloat16))
+        b_L21 += tl.dot(b_ka2.to(tl.bfloat16), tl.trans(b_kb1_at_a2).to(tl.bfloat16))
+        b_kb0_at_a3 = b_k0 * exp2(b_ga3[None, :] - b_g0)
+        b_kb1_at_a3 = b_k1 * exp2(b_ga3[None, :] - b_g1)
+        b_kb2_at_a3 = b_k2 * exp2(b_ga3[None, :] - b_g2)
+        b_L30 += tl.dot(b_ka3.to(tl.bfloat16), tl.trans(b_kb0_at_a3).to(tl.bfloat16))
+        b_L31 += tl.dot(b_ka3.to(tl.bfloat16), tl.trans(b_kb1_at_a3).to(tl.bfloat16))
+        b_L32 += tl.dot(b_ka3.to(tl.bfloat16), tl.trans(b_kb2_at_a3).to(tl.bfloat16))
+
+    # Load beta per sub-chunk: shape [BC] each
+    beta_base = beta_ptr + (bos * H + pid_h)
+    b_beta0 = tl.load(beta_base + (chunk_start_local + sc0 + o_c) * H,
+                      mask=m_sc0, other=0.0).to(tl.float32)
+    b_beta1 = tl.load(beta_base + (chunk_start_local + sc1 + o_c) * H,
+                      mask=m_sc1, other=0.0).to(tl.float32)
+    b_beta2 = tl.load(beta_base + (chunk_start_local + sc2 + o_c) * H,
+                      mask=m_sc2, other=0.0).to(tl.float32)
+    b_beta3 = tl.load(beta_base + (chunk_start_local + sc3 + o_c) * H,
+                      mask=m_sc3, other=0.0).to(tl.float32)
+
+    # Apply beta to L. Mask diagonal blocks to STRICT lower (i > j); off-diag full.
+    strict_lower = o_c[:, None] > o_c[None, :]
+    b_L00 = tl.where(strict_lower, b_L00 * b_beta0[:, None], 0.0)
+    b_L11 = tl.where(strict_lower, b_L11 * b_beta1[:, None], 0.0)
+    b_L22 = tl.where(strict_lower, b_L22 * b_beta2[:, None], 0.0)
+    b_L33 = tl.where(strict_lower, b_L33 * b_beta3[:, None], 0.0)
+    b_L10 = b_L10 * b_beta1[:, None]
+    b_L20 = b_L20 * b_beta2[:, None]
+    b_L21 = b_L21 * b_beta2[:, None]
+    b_L30 = b_L30 * b_beta3[:, None]
+    b_L31 = b_L31 * b_beta3[:, None]
+    b_L32 = b_L32 * b_beta3[:, None]
+
+    # Diagonal block inverses: X_aa = (I - L_aa)^-1 via Neumann series.
+    # L_aa is strict lower triangular 16x16, nilpotent. L_aa^16 = 0, so
+    # I + L + L^2 + ... + L^15 is exact. We do 15 iterations.
+    ident = tl.where(o_c[:, None] == o_c[None, :], 1.0, 0.0)
+
+    b_X00 = ident
+    b_term = b_L00
+    for _ in tl.static_range(BC - 1):
+        b_X00 = b_X00 + b_term
+        b_term = tl.dot(b_term.to(tl.bfloat16), b_L00.to(tl.bfloat16))
+
+    b_X11 = ident
+    b_term = b_L11
+    for _ in tl.static_range(BC - 1):
+        b_X11 = b_X11 + b_term
+        b_term = tl.dot(b_term.to(tl.bfloat16), b_L11.to(tl.bfloat16))
+
+    b_X22 = ident
+    b_term = b_L22
+    for _ in tl.static_range(BC - 1):
+        b_X22 = b_X22 + b_term
+        b_term = tl.dot(b_term.to(tl.bfloat16), b_L22.to(tl.bfloat16))
+
+    b_X33 = ident
+    b_term = b_L33
+    for _ in tl.static_range(BC - 1):
+        b_X33 = b_X33 + b_term
+        b_term = tl.dot(b_term.to(tl.bfloat16), b_L33.to(tl.bfloat16))
+
+    # Off-diagonal blocks via block-LU forward solve.
+    # For (I - L) X = I block-decomposed:
+    #   block (a, b) with a > b: (I - L_aa) X_ab = sum_{c=b..a-1} L_ac X_cb
+    #   so X_ab = X_aa · sum_{c=b..a-1} L_ac · X_cb
+    # Compute in topological order along the 'a - b' diagonal:
+    b_X10 = tl.dot(b_X11.to(tl.bfloat16),
+                   tl.dot(b_L10.to(tl.bfloat16), b_X00.to(tl.bfloat16)).to(tl.bfloat16))
+    b_X21 = tl.dot(b_X22.to(tl.bfloat16),
+                   tl.dot(b_L21.to(tl.bfloat16), b_X11.to(tl.bfloat16)).to(tl.bfloat16))
+    b_X32 = tl.dot(b_X33.to(tl.bfloat16),
+                   tl.dot(b_L32.to(tl.bfloat16), b_X22.to(tl.bfloat16)).to(tl.bfloat16))
+    # X_20 = X_22 · (L_20 · X_00 + L_21 · X_10)
+    b_X20 = tl.dot(b_X22.to(tl.bfloat16),
+                   (tl.dot(b_L20.to(tl.bfloat16), b_X00.to(tl.bfloat16)) +
+                    tl.dot(b_L21.to(tl.bfloat16), b_X10.to(tl.bfloat16))).to(tl.bfloat16))
+    b_X31 = tl.dot(b_X33.to(tl.bfloat16),
+                   (tl.dot(b_L31.to(tl.bfloat16), b_X11.to(tl.bfloat16)) +
+                    tl.dot(b_L32.to(tl.bfloat16), b_X21.to(tl.bfloat16))).to(tl.bfloat16))
+    b_X30 = tl.dot(b_X33.to(tl.bfloat16),
+                   (tl.dot(b_L30.to(tl.bfloat16), b_X00.to(tl.bfloat16)) +
+                    tl.dot(b_L31.to(tl.bfloat16), b_X10.to(tl.bfloat16)) +
+                    tl.dot(b_L32.to(tl.bfloat16), b_X20.to(tl.bfloat16))).to(tl.bfloat16))
+
+    # Validity masks (zero out beyond actual_len rows or cols)
+    valid_00 = m_sc0[:, None] & m_sc0[None, :]
+    valid_11 = m_sc1[:, None] & m_sc1[None, :]
+    valid_22 = m_sc2[:, None] & m_sc2[None, :]
+    valid_33 = m_sc3[:, None] & m_sc3[None, :]
+    valid_10 = m_sc1[:, None] & m_sc0[None, :]
+    valid_20 = m_sc2[:, None] & m_sc0[None, :]
+    valid_21 = m_sc2[:, None] & m_sc1[None, :]
+    valid_30 = m_sc3[:, None] & m_sc0[None, :]
+    valid_31 = m_sc3[:, None] & m_sc1[None, :]
+    valid_32 = m_sc3[:, None] & m_sc2[None, :]
+
+    b_X00 = tl.where(valid_00, b_X00, 0.0)
+    b_X11 = tl.where(valid_11, b_X11, 0.0)
+    b_X22 = tl.where(valid_22, b_X22, 0.0)
+    b_X33 = tl.where(valid_33, b_X33, 0.0)
+    b_X10 = tl.where(valid_10, b_X10, 0.0)
+    b_X20 = tl.where(valid_20, b_X20, 0.0)
+    b_X21 = tl.where(valid_21, b_X21, 0.0)
+    b_X30 = tl.where(valid_30, b_X30, 0.0)
+    b_X31 = tl.where(valid_31, b_X31, 0.0)
+    b_X32 = tl.where(valid_32, b_X32, 0.0)
+
+    ws_inv_base = ws_inv_ptr + (pid_t * H + pid_h) * BT * BT
+
+    # Store all 10 lower-tri sub-blocks of ws_inv. Upper-tri left zero.
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc0, sc0), block_shape=(BC, BC), order=(1, 0)),
+             b_X00.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc1, sc0), block_shape=(BC, BC), order=(1, 0)),
+             b_X10.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc1, sc1), block_shape=(BC, BC), order=(1, 0)),
+             b_X11.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc2, sc0), block_shape=(BC, BC), order=(1, 0)),
+             b_X20.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc2, sc1), block_shape=(BC, BC), order=(1, 0)),
+             b_X21.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc2, sc2), block_shape=(BC, BC), order=(1, 0)),
+             b_X22.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc3, sc0), block_shape=(BC, BC), order=(1, 0)),
+             b_X30.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc3, sc1), block_shape=(BC, BC), order=(1, 0)),
+             b_X31.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc3, sc2), block_shape=(BC, BC), order=(1, 0)),
+             b_X32.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(ws_inv_base, shape=(BT, BT), strides=(BT, 1),
+             offsets=(sc3, sc3), block_shape=(BC, BC), order=(1, 0)),
+             b_X33.to(ws_inv_ptr.dtype.element_ty), boundary_check=(0, 1))
+
+
+def kda_k1_inv(
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = 64,
+):
+    """Phase 1.3 — sub-chunked delta-rule inverse INV = (I - L)^-1.
+
+    Args:
+        k: [packed_seq, H, K] bf16 (post-l2norm).
+        g: [packed_seq, H, K] fp32 (post-cumsum, RCP_LN2 scaled).
+        beta: [packed_seq, H] fp32 (post-sigmoid, in [0, 1]).
+        cu_seqlens, chunk_indices, chunk_size: standard cuLA conventions.
+
+    Returns:
+        ws_inv: [total_NT, H, BT, BT] bf16 — full lower-tri INV (1 on diag, off-diag from fwd-sub).
+    """
+    assert chunk_size == 64
+    packed_seq, H, K = k.shape
+    BT, BC = 64, 16
+    if cu_seqlens is None:
+        cu_seqlens = prepare_uniform_cu_seqlens(1, packed_seq, k.device, torch.int32)
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    total_NT = chunk_indices.shape[0]
+    ws_inv = torch.zeros((total_NT, H, BT, BT), dtype=k.dtype, device=k.device)
+    BK = 32 if K >= 32 else K
+    grid = (total_NT, H, 1)
+    kda_k1_inv_kernel[grid](
+        k, g, beta, ws_inv,
+        cu_seqlens, chunk_indices,
+        H=H, K=K, BT=BT, BC=BC, BK=BK,
+    )
+    return ws_inv
+
+
+def kda_k1_inv_reference(
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_size: int = 64,
+):
+    """Reference: full 64x64 (I - L)^-1 via torch.linalg.solve_triangular.
+
+    L[i, j] = beta_i · sum_k k[i,k] · k[j,k] · exp2(g[i,k] - g[j,k])  for i > j, else 0.
+    """
+    BT = chunk_size
+    packed_seq, H, K = k.shape
+    if cu_seqlens is None:
+        cu_seqlens = prepare_uniform_cu_seqlens(1, packed_seq, k.device, torch.int32)
+
+    cs = cu_seqlens.cpu().tolist()
+    N = len(cs) - 1
+    chunks = []
+    for i_n in range(N):
+        bos, eos = cs[i_n], cs[i_n + 1]
+        T_seq = eos - bos
+        n_chunks = (T_seq + BT - 1) // BT
+        for i_t in range(n_chunks):
+            t_start = i_t * BT
+            t_end = min(t_start + BT, T_seq)
+            chunks.append((bos, t_start, t_end))
+
+    total_NT = len(chunks)
+    ws_inv = torch.zeros((total_NT, H, BT, BT), dtype=k.dtype, device=k.device)
+
+    for chunk_idx, (bos, t_start, t_end) in enumerate(chunks):
+        actual_len = t_end - t_start
+        seq_k = k[bos + t_start : bos + t_end].to(torch.float32)
+        seq_g = g[bos + t_start : bos + t_end].to(torch.float32)
+        seq_beta = beta[bos + t_start : bos + t_end].to(torch.float32)
+
+        for h in range(H):
+            kh = seq_k[:, h, :]   # [actual, K]
+            gh = seq_g[:, h, :]
+            bh = seq_beta[:, h]   # [actual]
+
+            # L[i, j] = beta_i * sum_k k[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])
+            L = torch.zeros((actual_len, actual_len), dtype=torch.float32, device=k.device)
+            for i in range(actual_len):
+                for j in range(i):
+                    decay = torch.exp2(gh[i] - gh[j])
+                    L[i, j] = (kh[i] * kh[j] * decay).sum() * bh[i]
+
+            A = torch.eye(actual_len, dtype=torch.float32, device=k.device) - L
+            X = torch.linalg.solve_triangular(A, torch.eye(actual_len, dtype=torch.float32, device=k.device),
+                                              upper=False, unitriangular=False)
+            ws_inv[chunk_idx, h, :actual_len, :actual_len] = X.to(k.dtype)
+
+    return ws_inv
+
+
 def kda_k1_mqk_reference(
     q: torch.Tensor,
     k: torch.Tensor,

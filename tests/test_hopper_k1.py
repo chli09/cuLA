@@ -17,6 +17,8 @@ from fla.utils import assert_close, device
 from cula.kda.hopper_k1 import (
     kda_k1_decay_apply,
     kda_k1_decay_apply_reference,
+    kda_k1_inv,
+    kda_k1_inv_reference,
     kda_k1_mqk,
     kda_k1_mqk_reference,
 )
@@ -161,6 +163,25 @@ def test_mqk_matches_reference(B, T, H, K):
     o_arr = torch.arange(64, device=device)
     upper = (o_arr[:, None] < o_arr[None, :]).expand_as(ws_mqk_t)
     assert (ws_mqk_t[upper] == 0).all(), "ws_mqk non-zero above diagonal"
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "K"),
+    [
+        (1, 64, 4, 128),
+        (1, 128, 4, 128),
+    ],
+    ids=["B1T64", "B1T128"],
+)
+def test_inv_matches_reference(B, T, H, K):
+    """Phase 1.3: ws_inv = (I - tril_strict(beta·k·k^T·decay))^-1 via block LU."""
+    q, k, g, beta, cu_seqlens = _make_inputs(B, T, H, K)
+
+    ws_inv_t = kda_k1_inv(k, g, beta, cu_seqlens=cu_seqlens, chunk_size=64)
+    ws_inv_r = kda_k1_inv_reference(k, g, beta, cu_seqlens=cu_seqlens, chunk_size=64)
+
+    # Generous tolerance: bf16 MMA chains compound rounding error
+    assert_close("ws_inv", ws_inv_t, ws_inv_r, ratio=1e-2)
 
 
 def test_decay_apply_zero_fill_tail():
