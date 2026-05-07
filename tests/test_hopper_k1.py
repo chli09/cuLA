@@ -14,7 +14,12 @@ from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import assert_close, device
 
-from cula.kda.hopper_k1 import kda_k1_decay_apply, kda_k1_decay_apply_reference
+from cula.kda.hopper_k1 import (
+    kda_k1_decay_apply,
+    kda_k1_decay_apply_reference,
+    kda_k1_mqk,
+    kda_k1_mqk_reference,
+)
 
 pytestmark = pytest.mark.sm90_only
 
@@ -130,6 +135,32 @@ def test_decay_apply_varlen():
     assert_close("ws_kd_varlen", ws_kd_t, ws_kd_r, ratio=2e-3)
     assert_close("ws_kr_varlen", ws_kr_t, ws_kr_r, ratio=2e-3)
     assert_close("ws_gt_varlen", ws_gt_t, ws_gt_r, ratio=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "K"),
+    [
+        (1, 64, 4, 128),
+        (1, 128, 4, 128),
+        (1, 1024, 4, 128),  # H=4 to keep test fast (reference is O(BT^2 * K))
+    ],
+    ids=["B1T64", "B1T128", "B1T1024"],
+)
+def test_mqk_matches_reference(B, T, H, K):
+    """Phase 1.2: sub-chunked Mqk with anchor-decay trick, no exp2(-g) overflow."""
+    scale = 1.0 / (K**0.5)
+    q, k, g, _, cu_seqlens = _make_inputs(B, T, H, K)
+
+    ws_mqk_t = kda_k1_mqk(q, k, g, scale, cu_seqlens=cu_seqlens, chunk_size=64)
+    ws_mqk_r = kda_k1_mqk_reference(q, k, g, scale, cu_seqlens=cu_seqlens, chunk_size=64)
+
+    # bf16 outputs from MMA: relax tolerance
+    assert_close("ws_mqk", ws_mqk_t, ws_mqk_r, ratio=5e-3)
+
+    # Sanity: above-diagonal must be zero
+    o_arr = torch.arange(64, device=device)
+    upper = (o_arr[:, None] < o_arr[None, :]).expand_as(ws_mqk_t)
+    assert (ws_mqk_t[upper] == 0).all(), "ws_mqk non-zero above diagonal"
 
 
 def test_decay_apply_zero_fill_tail():
