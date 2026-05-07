@@ -977,3 +977,49 @@ def kda_k1_decay_apply_reference(
         ws_gt[chunk_idx] = torch.exp2(g_total_log)
 
     return ws_qd, ws_kd, ws_kr, ws_gt
+
+
+def kda_k1_full(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = 64,
+):
+    """Unified K1 entry point. Calls all 3 K1 sub-kernels and returns the full
+    workspace that K2 (cuLA fused, post-refactor) needs to consume.
+
+    Args:
+        q: [packed_seq, H, K] bf16, post-l2norm.
+        k: [packed_seq, H, K] bf16, post-l2norm.
+        g: [packed_seq, H, K] fp32, post-chunk-local cumsum + RCP_LN2 scaled.
+        beta: [packed_seq, H] fp32, post-sigmoid (in [0, 1]).
+        scale: attention scale.
+        cu_seqlens, chunk_indices, chunk_size: standard cuLA conventions.
+
+    Returns dict of workspace tensors:
+        ws_qd, ws_kd, ws_kr: [total_NT, H, BT, K]   bf16
+        ws_gt:               [total_NT, H, K]        fp32
+        ws_mqk:              [total_NT, H, BT, BT]   bf16
+        ws_inv:              [total_NT, H, BT, BT]   bf16
+    """
+    ws_qd, ws_kd, ws_kr, ws_gt = kda_k1_decay_apply(
+        q, k, g, scale, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, chunk_size=chunk_size
+    )
+    ws_mqk = kda_k1_mqk(
+        q, k, g, scale, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, chunk_size=chunk_size
+    )
+    ws_inv = kda_k1_inv(
+        k, g, beta, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, chunk_size=chunk_size
+    )
+    return {
+        "ws_qd": ws_qd,
+        "ws_kd": ws_kd,
+        "ws_kr": ws_kr,
+        "ws_gt": ws_gt,
+        "ws_mqk": ws_mqk,
+        "ws_inv": ws_inv,
+    }
