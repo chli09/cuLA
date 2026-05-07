@@ -38,17 +38,17 @@ def _make_inputs(B, T, H, K, dtype=torch.bfloat16, seed=0):
     q = torch.nn.functional.normalize(q.float(), dim=-1).to(dtype)
     k = torch.nn.functional.normalize(k.float(), dim=-1).to(dtype)
 
-    # Pack to [packed_seq=B*T, H, K]
-    q_packed = q.reshape(B * T, H, K).contiguous()
-    k_packed = k.reshape(B * T, H, K).contiguous()
-    g_packed = g_raw.reshape(B * T, H, K).contiguous()
-    beta_packed = beta.reshape(B * T, H).contiguous()
+    # Pack [B, T, ...] -> [1, B*T, ...] (matches hopper_fused_fwd's flatten step)
+    q_4d = q.reshape(1, B * T, H, K).contiguous()
+    k_4d = k.reshape(1, B * T, H, K).contiguous()
+    g_4d = g_raw.reshape(1, B * T, H, K).contiguous()
+    beta_4d = beta.reshape(1, B * T, H).contiguous()
 
     cu_seqlens = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=device)
 
     # Chunk-cumsum of g (exactly what hopper_fused_fwd does pre-K1)
-    g_cumsum = kda_gate_chunk_cumsum(
-        g=g_packed,
+    g_cumsum_4d = kda_gate_chunk_cumsum(
+        g=g_4d,
         A_log=A_log,
         dt_bias=dt_bias,
         scale=RCP_LN2,
@@ -57,7 +57,13 @@ def _make_inputs(B, T, H, K, dtype=torch.bfloat16, seed=0):
         chunk_indices=None,
         lower_bound=-5.0,
     )
-    return q_packed, k_packed, g_cumsum, beta_packed, cu_seqlens
+
+    # Now flatten to 3D [packed_seq=B*T, H, K] for K1 kernel
+    q_packed = q_4d.reshape(B * T, H, K).contiguous()
+    k_packed = k_4d.reshape(B * T, H, K).contiguous()
+    g_packed = g_cumsum_4d.reshape(B * T, H, K).contiguous()
+    beta_packed = beta_4d.reshape(B * T, H).contiguous()
+    return q_packed, k_packed, g_packed, beta_packed, cu_seqlens
 
 
 @pytest.mark.parametrize(
@@ -91,9 +97,16 @@ def test_decay_apply_matches_reference(B, T, H, K):
 
 
 def test_decay_apply_varlen():
-    """Variable-length: 3 sequences with different lengths in one packed tensor."""
+    """Variable-length: 3 sequences in one packed tensor.
+
+    Seq lens are chunk-size (64) aligned. FLA's kda_gate_chunk_cumsum runs
+    fixed-size 64-token cumsum chunks irrespective of cu_seqlens, so the
+    cu_seqlens entries it consumes have to be 64-aligned in real usage.
+    cuLA's hopper_fused_fwd Python orchestrator only packs uniform-len
+    sequences, so this is the regime that matters for K1's contract.
+    """
     H, K = 4, 128
-    seq_lens = [200, 130, 64]  # not all chunk-aligned
+    seq_lens = [192, 128, 64]  # all multiples of chunk_size=64
     T_total = sum(seq_lens)
 
     cu_seqlens = torch.tensor(
