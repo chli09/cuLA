@@ -1324,6 +1324,16 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 cutlass::arch::fence_view_async_shared();
             }
             s_decay(tKVrKV, alpha_last_smem_pipe_read);
+            // Layer 2: also apply gate decay to M_cumprod. This corresponds to
+            // M_chunk's diagonal part (M_chunk = diag(decay) - kg^T·w; this line
+            // covers the diag(decay) factor only — the kg^T·w correction is not
+            // yet implemented and is the remaining TODO for full Layer 2).
+            // tMrM shares tKVrKV's [V, K] partitioning, so s_decay's V-indexed
+            // alpha_last lookup gives `tMrM[i, j] *= decay[i]` — exactly the
+            // row-scaling of M_cumprod by diag(decay).
+            if constexpr (kEmitTransition) {
+                s_decay(tMrM, alpha_last_smem_pipe_read);
+            }
 
             // synchronize 2 WGs before rewriting sQ_K_scaled
             cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
