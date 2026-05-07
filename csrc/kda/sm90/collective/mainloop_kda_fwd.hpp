@@ -864,6 +864,15 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         Tensor tKVrKV = partition_fragment_C(kv_thr_mma, select<0, 1>(TileShapeKV{}));
 
+        // Layer 2: per-segment transition matrix M_cumprod ∈ R^{K, K} fp32.
+        // Allocated unconditionally (the constexpr-gated identity init / store below
+        // is what determines whether this fragment carries useful data); when
+        // kEmitTransition=false the compiler should DCE the dead writes.
+        // We reuse kv_tiled_mma's accumulator partitioning — TileShapeKV's <0,1>
+        // are (V=128, K=128), numerically identical to M's [K, K] storage.
+        Tensor tMrM = partition_fragment_C(kv_thr_mma, select<0, 1>(TileShapeKV{}));
+        Tensor tMcM = kv_thr_mma.partition_C(make_identity_tensor(select<0, 1>(TileShapeKV{})));
+
         // Tensor tKVrV    = kv_thr_mma.partition_fragment_A(sVkv(_, _, _0{}));  // mma src
         // Tensor tKVrV_cv = tKVrV_thr_copy.retile_D(tKVrV);                     // copy view dst
         // Tensor tKVsV    = tKVrV_thr_copy.partition_S(sVkv);                   // copy view src
@@ -951,6 +960,43 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // transposed store state
             auto tKVgKV = thr_copy_kv.partition_D(select_tensor<1, 0>(gKV));
             copy(tiled_copy_kv, tKVrKV, tKVgKV);
+        };
+
+        // Layer 2: identity-init for M_cumprod at segment start. No-op when
+        // kEmitTransition=false (compiler removes the loop body).
+        auto m_init_identity = [&]() INLINE_LAMBDA {
+            if constexpr (kEmitTransition) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size(tMrM); ++i) {
+                    auto coord = tMcM(i);
+                    auto row = get<0>(coord);
+                    auto col = get<1>(coord);
+                    tMrM(i) = (row == col) ? 1.0f : 0.0f;
+                }
+            }
+        };
+
+        // Layer 2: TMA-store M_cumprod at segment end. GMEM layout matches
+        // ptr_output_state's: (K, K, H, N_seg, N_seq) LayoutLeft, K-contiguous.
+        // No-op when kEmitTransition=false or ptr_output_M is null.
+        auto m_store = [&]() INLINE_LAMBDA {
+            if constexpr (kEmitTransition) {
+                if (params.ptr_output_M == nullptr) return;
+                int num_state_heads = problem_size.num_heads;
+                int state_head_idx = work_desc.o_head_idx();
+                int seg_idx = work_desc.seg_idx;
+                auto gM = make_tensor(
+                    make_gmem_ptr(params.ptr_output_M),
+                    make_layout(make_shape(
+                        Int<HeadSizeQK>{}, Int<HeadSizeQK>{}, num_state_heads,
+                        Int<kNumSegments>{}, problem_size.num_seqs)))(
+                    _, _, state_head_idx, seg_idx, seq_idx);  // (K, K)
+
+                auto tiled_copy_m = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
+                auto thr_copy_m = tiled_copy_m.get_thread_slice(thread_idx);
+                auto tMgM = thr_copy_m.partition_D(select_tensor<1, 0>(gM));
+                copy(tiled_copy_m, tMrM, tMgM);
+            }
         };
 
         auto s_decay = [&](auto& tKVrKV, auto const& alpha_last_smem_pipe_read) INLINE_LAMBDA {
@@ -1376,6 +1422,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // }
         };
 
+        // Layer 2: init M_cumprod = identity at segment start. No-op when
+        // kEmitTransition=false. Note: actual chunk-level update of M is
+        // not yet implemented — see TODO inside compute_loop_body. With this
+        // scaffold, output_M is currently identity-filled (placeholder).
+        m_init_identity();
+
         if constexpr (!kInitStateFromInput) {
             clear(tKVrKV);
             compute_loop_body(0, /*is_first_block_=*/cute::true_type{}, /*is_final_block_=*/cute::false_type{});
@@ -1394,6 +1446,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 /*is_final_block_=*/cute::true_type{});
         }
         kv_store();
+        m_store();   // Layer 2: TMA-store M_cumprod (no-op if kEmitTransition=false)
     }
 
     template <class ProblemShape, class WorkDesc>
