@@ -83,6 +83,7 @@ enum class Tag {
     kSafeGate,            // KDA
     kElementBetaGmem,     // GMEM element type for beta (default float, can be bf16)
     kNumSegments,         // ChunkWiseParallel: split each (seq, head)'s T-axis into N segments to expand grid
+    kEmitTransition,      // KDA segment-scan: emit per-segment transition matrix M [K,K] fp32 to GMEM (Layer 2)
 };
 
 }  // namespace kda::sm90::kernel

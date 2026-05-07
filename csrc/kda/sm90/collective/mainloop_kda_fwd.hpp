@@ -96,6 +96,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     static constexpr int kNumSegments =
         find_option_t<Tag::kNumSegments, std::integral_constant<int, 1>, Options>::value;
 
+    // Layer 2: emit per-segment transition matrix M ∈ R^{K, K} (fp32) to GMEM at segment end.
+    // When true, the mainloop maintains M_cumprod = ∏_chunk (diag(decay) - kg^T·w) across the
+    // segment's chunk loop and TMA-stores it to ptr_output_M just before kv_store.
+    // Default false → no extra register/SMEM/GMEM cost; existing instantiations unchanged.
+    static constexpr bool kEmitTransition = find_option_t<Tag::kEmitTransition, false_type, Options>::value;
+
     static constexpr int NumLoadWarpGroups = 1;
     static constexpr int NumStateMmaWarpGroups = 2;
     static constexpr int NumAuxMmaWarpGroups = 1;
@@ -478,6 +484,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     float   const* ptr_Alpha; LayoutAlpha dAlpha;
     float*        ptr_output_state; // layout fixed (kdim, vdim, num_heads, num_seqs):LayoutLeft{}
     float const*  ptr_input_state;
+    // Layer 2 (kEmitTransition=true only): per-segment transition matrix output buffer.
+    // Layout: (K, K, H, N_seg, N_seq) fp32 LayoutLeft, K-contiguous. May be nullptr when
+    // kEmitTransition=false.
+    float*        ptr_output_M = nullptr;
     float scale;
     ElementBetaGmem const* beta_ptr;  GmemStrideBeta beta_stride;
   };  // clang-format on
@@ -493,6 +503,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         float* ptr_output_state;
         float const* ptr_input_state;
+        float* ptr_output_M = nullptr;  // Layer 2
 
         ElementBetaGmem const* beta_ptr;
         GmemLayoutBeta beta_layout;
@@ -569,6 +580,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
             .ptr_output_state = args.ptr_output_state,
             .ptr_input_state = args.ptr_input_state,
+            .ptr_output_M = args.ptr_output_M,
 
             // TODO: refactor all name to varname_vartype
             .beta_ptr = args.beta_ptr,

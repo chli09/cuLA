@@ -21,7 +21,10 @@
 
 using OptionalTensor = std::optional<torch::Tensor>;
 
-std::tuple<torch::Tensor, torch::Tensor>
+// Returns (o, output_state, output_M).
+// output_M is shape [N_seq, num_segments, H, K, K] fp32 when emit_transition=true,
+// else returns an empty undefined Tensor (callers should check defined()).
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 kda_fwd_prefill(
     OptionalTensor output_,
     OptionalTensor output_state_,
@@ -35,7 +38,9 @@ kda_fwd_prefill(
     torch::Tensor workspace_buffer,
     float scale,
     bool safe_gate,
-    int64_t num_segments = 1) {
+    int64_t num_segments = 1,
+    bool emit_transition = false,           // Layer 2: enable per-segment transition matrix M emit
+    OptionalTensor output_M_ = std::nullopt) {
     // Q, K, V: [packed_seq, H, D] (already packed by Python layer)
     auto packed_seq = q.size(0);
     auto num_heads = q.size(1);
@@ -129,6 +134,24 @@ kda_fwd_prefill(
         input_state_ptr = input_state.data_ptr<float>();
     }
 
+    // Layer 2: per-segment transition matrix M output buffer.
+    // Allocated only when emit_transition=true. Shape [N_seq, num_segments, H, K, K] fp32.
+    torch::Tensor output_M;  // undefined Tensor by default
+    float* output_M_ptr = nullptr;
+    if (emit_transition) {
+        output_M = output_M_.has_value()
+                       ? output_M_.value()
+                       : torch::zeros(
+                             {num_seqs, num_segments, num_heads, head_size, head_size},
+                             torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+        TORCH_CHECK(output_M.dtype() == torch::kFloat32, "output_M must be float32");
+        TORCH_CHECK(output_M.is_contiguous(), "output_M must be contiguous");
+        TORCH_CHECK(
+            output_M.numel() == num_seqs * num_segments * num_heads * head_size * head_size,
+            "output_M numel mismatch: expected N_seq*N_seg*H*K*K");
+        output_M_ptr = output_M.data_ptr<float>();
+    }
+
     // Auto-compute scale if 0
     if (scale == 0.0f) {
         scale = 1.0f / std::sqrt(static_cast<float>(head_size));
@@ -162,7 +185,8 @@ kda_fwd_prefill(
             scale,
             safe_gate,
             static_cast<int32_t>(num_segments),
-            static_cast<int32_t>(sm_count));
+            static_cast<int32_t>(sm_count),
+            output_M_ptr);
     } else {
         float const* beta_ptr = beta_.has_value() ? beta_.value().data_ptr<float>() : nullptr;
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, float>(
@@ -184,8 +208,9 @@ kda_fwd_prefill(
             scale,
             safe_gate,
             static_cast<int32_t>(num_segments),
-            static_cast<int32_t>(sm_count));
+            static_cast<int32_t>(sm_count),
+            output_M_ptr);
     }
 
-    return {output, output_state};
+    return {output, output_state, output_M};
 }

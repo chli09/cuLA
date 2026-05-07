@@ -34,7 +34,8 @@ template <
     bool NeedsAlpha,
     bool InitStateFromInput,
     bool SafeGate,
-    int NumSegments,  // ChunkWiseParallel grid expansion factor; 1 == legacy (one block per (seq, head))
+    int NumSegments,        // ChunkWiseParallel grid expansion factor; 1 == legacy (one block per (seq, head))
+    bool EmitTransition,    // Layer 2: emit per-segment transition matrix M to output_M (fp32 [K,K] per seg/head/seq)
     typename ArchTag,
     typename TO,
     typename TQKV,
@@ -58,7 +59,8 @@ launch_kda_fwd_prefill_kernel_gbai(
     int32_t head_size,
     int64_t total_seqlen,
     float scale,
-    int32_t sm_count) {
+    int32_t sm_count,
+    float* output_M = nullptr) {  // Layer 2: only used when EmitTransition=true
 #if defined(CULA_SM90A_ENABLED)
     constexpr bool HopperSupported = true;
 #else
@@ -79,19 +81,22 @@ launch_kda_fwd_prefill_kernel_gbai(
         using NeedsAlphaType = std::conditional_t<NeedsAlpha, cute::true_type, cute::false_type>;
         using InitStateType = std::conditional_t<InitStateFromInput, cute::true_type, cute::false_type>;
         using NumSegmentsType = std::integral_constant<int, NumSegments>;
+        using EmitTransitionType = std::conditional_t<EmitTransition, cute::true_type, cute::false_type>;
         using Options = decltype(add_option(
-            Option<Tag::kNumSegments, NumSegmentsType>{},
+            Option<Tag::kEmitTransition, EmitTransitionType>{},
             add_option(
-                Option<Tag::kElementBetaGmem, TBeta>{},
+                Option<Tag::kNumSegments, NumSegmentsType>{},
                 add_option(
-                    Option<Tag::kSafeGate, SafeGateType>{},
+                    Option<Tag::kElementBetaGmem, TBeta>{},
                     add_option(
-                        Option<Tag::kInitStateFromInput, InitStateType>{},
+                        Option<Tag::kSafeGate, SafeGateType>{},
                         add_option(
-                            Option<Tag::kNeedsAlpha, NeedsAlphaType>{},
+                            Option<Tag::kInitStateFromInput, InitStateType>{},
                             add_option(
-                                Option<Tag::kNeedsBeta, NeedsBetaType>{},
-                                add_option(Option<Tag::kIsDeltaRule, cute::true_type>{}, DefaultOptions{}))))))));
+                                Option<Tag::kNeedsAlpha, NeedsAlphaType>{},
+                                add_option(
+                                    Option<Tag::kNeedsBeta, NeedsBetaType>{},
+                                    add_option(Option<Tag::kIsDeltaRule, cute::true_type>{}, DefaultOptions{})))))))));
 
         using TileShape = Shape<_64, _64, _128>;
         using Scheduler = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
@@ -133,6 +138,7 @@ launch_kda_fwd_prefill_kernel_gbai(
                 .ptr_Alpha = alpha,  .dAlpha = {tok_stride, _1{}, head_stride},
                 .ptr_output_state = (float*)output_state,
                 .ptr_input_state  = (float*)input_state,
+                .ptr_output_M     = (float*)output_M,
                 .scale = scale,
                 .beta_ptr  = beta,  .beta_stride  = {num_heads, 1},
         },  // clang-format on

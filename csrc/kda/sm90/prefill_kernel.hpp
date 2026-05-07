@@ -46,6 +46,7 @@ launch_kda_fwd_prefill_kernel(
     float scale,
     bool safe_gate,
     int32_t num_segments = 1,
-    int32_t sm_count = 0);
+    int32_t sm_count = 0,
+    float* output_M = nullptr);  // Layer 2: optional [N_seq, N_seg, H, K, K] fp32 buffer
 
 }  // namespace kda::sm90

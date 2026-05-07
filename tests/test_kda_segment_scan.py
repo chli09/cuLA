@@ -39,9 +39,13 @@ SHAPES = [
 @pytest.mark.parametrize("num_segments", [2, 4, 8, 16, 32], ids=["N2", "N4", "N8", "N16", "N32"])
 @pytest.mark.parametrize("B,H,T", SHAPES)
 @pytest.mark.parametrize("with_init_state", [False, True], ids=["init_zero", "init_random"])
-def test_segment_scan_n2_matches_single_pass(B: int, H: int, T: int, with_init_state: bool, num_segments: int):
+@pytest.mark.parametrize("use_full_fla_path", [False, True], ids=["hybrid_2pass", "full_fla_1pass"])
+def test_segment_scan_n2_matches_single_pass(
+    B: int, H: int, T: int, with_init_state: bool, num_segments: int, use_full_fla_path: bool,
+):
     """Segment-scan orchestrator must match single-pass on (o, final_state)
-    for each supported num_segments value."""
+    for each supported num_segments value, on both the 2-pass hybrid and the
+    full-FLA ~1.x-pass paths."""
     D = 128
     chunk_size = 64
     if T % (chunk_size * num_segments) != 0:
@@ -82,8 +86,10 @@ def test_segment_scan_n2_matches_single_pass(B: int, H: int, T: int, with_init_s
     # Reference: single-pass fused kernel (the unchanged path; bit-identical to before C2-2)
     o_ref, ht_ref = cula_kda_prefill(**{**common_kw, "num_segments": 1})
 
-    # Under test: segment-scan orchestrator
-    o_seg, ht_seg = cula_kda_segment_scan_prefill(**{**common_kw, "num_segments": num_segments})
+    # Under test: segment-scan orchestrator on the requested path
+    o_seg, ht_seg = cula_kda_segment_scan_prefill(
+        **{**common_kw, "num_segments": num_segments, "use_full_fla_path": use_full_fla_path},
+    )
 
     # Tolerance — same as the existing test_kda_fused_fwd checks.
     # For num_segments >= 3 we use FLA's M kernel which uses FLA-recomputed

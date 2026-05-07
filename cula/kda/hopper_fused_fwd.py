@@ -166,6 +166,7 @@ def _kda_hopper_call_kernel(
     initial_state: torch.Tensor | None = None,
     output_state: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    emit_transition: bool = False,
 ):
     """Single C++ kernel invocation against pre-prepared packed tensors.
 
@@ -177,6 +178,11 @@ def _kda_hopper_call_kernel(
 
     output_state: optional pre-allocated output buffer. None lets the C++ side
     auto-allocate the appropriate shape.
+
+    emit_transition: when True, the kernel additionally emits the per-segment
+    transition matrix M ∈ R^{K, K} (fp32) to a returned tensor of shape
+    [N_seq, num_segments, H, K, K]. Layer 2 path. Returned as the third tuple
+    element (None when emit_transition=False).
     """
     num_seqs = prep["num_seqs"]
     num_heads = prep["num_heads"]
@@ -200,7 +206,7 @@ def _kda_hopper_call_kernel(
     else:
         seg_input_state = initial_state
 
-    o, final_state = cula_cuda.kda_fwd_prefill(
+    o, final_state, output_M = cula_cuda.kda_fwd_prefill(
         None, output_state,
         prep["q"], prep["k"], prep["v"],
         seg_input_state,
@@ -208,10 +214,13 @@ def _kda_hopper_call_kernel(
         prep["beta"],
         prep["cu_seqlens"], prep["workspace_buffer"],
         scale, safe_gate, num_segments,
+        emit_transition, None,
     )
     o = rearrange(o, "(b t) h d -> b t h d", b=prep["batch_size"])
     if out_dtype is not None:
         o = o.to(out_dtype)
+    if emit_transition:
+        return o, final_state, output_M
     return o, final_state
 
 
@@ -488,6 +497,102 @@ def _kda_compute_segment_initial_states(
     return pass2_init
 
 
+def _kda_compute_segment_initial_states_full_fla(
+    prep: dict,
+    initial_state: torch.Tensor | None,
+    num_segments: int,
+    safe_gate: bool,
+    scale: float,
+    chunk_size: int = CHUNK_SIZE,
+) -> torch.Tensor:
+    """Build per-segment h_initial via full FLA path — no cuLA Pass 1 dependency.
+
+    This is the FLA-CP-style ~1.x-pass approach (issue #11 PR4 / Step 1).
+    Skips cuLA Pass 1 entirely; derives (h_ext, M) for ALL segments from FLA's
+    pre_process_fwd_kernel_merged, then chains them from user_init via
+    merge_fwd_bwd_kernel to produce pass2_init for every segment.
+
+    Pipeline (replaces cuLA Pass 1 + the hybrid bootstrap in
+    _kda_compute_segment_initial_states):
+      1. FLA chunk_kda_fwd_intra ~95μs        recover (w, u, kg)
+      2. _kda_extract_all_segment_ag_hm ~40μs fused-M for all N segments
+      3. _kda_merge_segment_chain_via_fla ~50μs  chain from user_init
+                                               (skip_first_seg=False)
+
+    Caveat: a previous attempt at this path broke pytest at ``init_random``
+    tolerance — FLA's M_0 / h_ext_0 differ slightly from cuLA's (likely due
+    to bf16 cast ordering inside the WY-decomp), and the M_0 @ h_initial
+    product amplifies that gap proportional to ‖h_initial‖. The root cause
+    has not been diagnosed; this function exists to provide a clean entry
+    point to (a) reproduce the failure, (b) bisect to a single tensor diff,
+    (c) fix at source if it's a real bug, or (d) loosen tolerance if it's a
+    well-bounded numerical drift. See the ``use_full_fla_path`` flag on
+    :func:`cula_kda_segment_scan_prefill`.
+    """
+    num_seqs = prep["num_seqs"]
+    num_heads = prep["num_heads"]
+    head_dim = prep["head_dim"]
+    head_dim_v = prep["head_dim_v"]
+    device = prep["q"].device
+
+    pass2_init = torch.zeros(
+        (num_seqs, num_segments, num_heads, head_dim, head_dim_v),
+        dtype=torch.float32, device=device,
+    )
+    if initial_state is not None:
+        pass2_init[:, 0, ...] = initial_state
+
+    # Step 1: FLA chunk_kda_fwd_intra → recover (w, u, kg).
+    q4 = prep["q"].unsqueeze(0)
+    k4 = prep["k"].unsqueeze(0)
+    v4 = prep["v"].unsqueeze(0)
+    g4 = prep["g"].unsqueeze(0)
+    beta4 = prep["beta"].unsqueeze(0)
+    w_full, u_full, _qg, kg_full, _Aqk, _Akk = chunk_kda_fwd_intra(
+        q=q4, k=k4, v=v4, gk=g4, beta=beta4,
+        scale=scale, chunk_size=chunk_size, safe_gate=safe_gate,
+    )
+
+    T_packed = q4.shape[1]
+    assert T_packed % (num_seqs * num_segments) == 0, (
+        f"non-uniform segment length not yet supported "
+        f"(packed_seq={T_packed}, num_seqs={num_seqs}, num_segments={num_segments})"
+    )
+
+    # Step 2: FLA fused-M kernel → ag_hm[num_seqs * num_segments, H, K, K+V].
+    ag_hm = _kda_extract_all_segment_ag_hm(
+        kg_full=kg_full, u_full=u_full, w_full=w_full, gk_full=g4,
+        num_segments=num_segments, num_orig_seqs=num_seqs, chunk_size=chunk_size,
+    )
+
+    # Step 3: FLA merge — chain ALL segments from user_init.
+    # skip_first_seg=False so each orig seq runs ag_hm[0..N-1] from h0=user_init,
+    # producing pass2_init[:, 1..N-1] for that seq.
+    if initial_state is None:
+        h0 = torch.zeros(
+            (num_seqs, num_heads, head_dim, head_dim_v),
+            dtype=torch.float32, device=device,
+        )
+    else:
+        h0 = initial_state.contiguous()
+
+    initial_states_merge = _kda_merge_segment_chain_via_fla(
+        ag_hm=ag_hm,
+        initial_state=h0,
+        num_segments=num_segments,
+        num_orig_seqs=num_seqs,
+        H=num_heads, K=head_dim, V=head_dim_v,
+        device=device,
+        skip_first_seg=False,
+    )  # [num_seqs * (N_seg - 1), H, K, V]
+
+    # Reshape to [num_seqs, N_seg-1, H, K, V] and assign to pass2_init[:, 1:].
+    pass2_init[:, 1:, ...] = initial_states_merge.view(
+        num_seqs, num_segments - 1, num_heads, head_dim, head_dim_v,
+    )
+    return pass2_init
+
+
 class HopperChunkKDAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
@@ -667,6 +772,7 @@ def cula_kda_segment_scan_prefill(
     cu_seqlens: torch.IntTensor | None = None,
     chunk_indices: torch.IntTensor | None = None,
     num_segments: int | str = 2,
+    use_full_fla_path: bool = False,
     **kwargs,
 ):
     r"""
@@ -681,6 +787,20 @@ def cula_kda_segment_scan_prefill(
     string ``"auto"`` to let :func:`auto_num_segments` pick the value that
     best saturates the SM array given (num_seqs, num_heads, seq_len) and
     the device's SM count.
+
+    ``use_full_fla_path`` selects the orchestration strategy when
+    ``num_segments >= 2``:
+
+    - ``False`` (default): 2-pass hybrid. cuLA Pass 1 produces the
+      cuLA-consistent ``h_seg_pass1[:, 0] = M_0 @ user_init + h_ext_0``;
+      FLA's merge kernel handles segs ≥ 2. Bit-exact-stable across init
+      shapes (used by the existing pytest matrix).
+    - ``True``: full-FLA ~1.x-pass. Skip cuLA Pass 1; derive (h_ext, M)
+      for ALL segments via FLA pre_process + merge, then run the cuLA
+      fused kernel ONCE with corrected init. Saves ~250 μs vs the 2-pass
+      hybrid, but a past attempt broke ``init_random`` tolerance — root
+      cause not yet diagnosed. Use as an opt-in for benchmarking and
+      diagnosis.
 
     Two-pass implementation (for num_segments == 2):
 
@@ -777,20 +897,23 @@ def cula_kda_segment_scan_prefill(
     if scale is None:
         scale = q.shape[-1] ** -0.5
 
-    # ── 2-pass hybrid design (post 2026-05-04 nsys + correctness findings) ──
-    # Pass 1 keeps cuLA-consistent h_seg_pass1[:, 0] = M_0 @ user_init + h_ext_0
-    # for the first chain step (full-FLA path here breaks tol on init_random).
-    # FLA merge kernel handles segs 2..N-1 in one launch — replaces the host
-    # Python fold loop that was costing ~30μs per fold step (= ~1ms+ at N=16).
+    # ── Two implementation paths, selected by ``use_full_fla_path`` ─────
     #
-    # Pipeline (per call, segment-scan path):
-    #   1. prep                     cumsum + l2norm × 2 + reshape
-    #   2. cuLA pass 1              [user_init, 0, 0, ...] → h_seg_pass1[:, k]
-    #   3. FLA intra (N≥3)          recover (w, u, kg)
-    #   4. fused-M kernel (N≥3)     ag_hm[N, H, K, K+V] = (h_ext, M) all in 1 launch
-    #   5. FLA merge kernel (N≥3)   skip seg 0, chain ag_hm[1..N-1] from h_seg_pass1[:, 0]
-    #                                → produces pass2_init[:, 2..N-1]
-    #   6. cuLA pass 2              corrected per-segment init → final o + h_final
+    # 2-pass hybrid (default, use_full_fla_path=False):
+    #   Pass 1 keeps cuLA-consistent h_seg_pass1[:, 0] = M_0 @ user_init + h_ext_0
+    #   for the first chain step. FLA merge handles segs 2..N-1.
+    #   Pipeline: prep + cuLA Pass 1 + (FLA intra + fused-M + merge for N≥3)
+    #             + cuLA Pass 2.
+    #   Cost: ~1.12 ms in the worst-case shape.
+    #
+    # Full-FLA ~1.x-pass (use_full_fla_path=True):
+    #   Skip cuLA Pass 1; derive (h_ext, M) for ALL segments from FLA's
+    #   pre_process_fwd_kernel_merged, chain from user_init, then run cuLA
+    #   fused kernel ONCE with corrected per-segment init.
+    #   Pipeline: prep + FLA intra + fused-M + merge + cuLA forward (1×).
+    #   Estimated cost: ~700 μs (saves ~250 μs vs the 2-pass hybrid).
+    #   Caveat: a previous attempt at this path broke pytest at init_random
+    #   tolerance — root cause not yet diagnosed. Use with care.
     out_dtype = q.dtype
     prep = _kda_hopper_prep(
         q, k, v, g, beta, A_log, dt_bias,
@@ -800,19 +923,24 @@ def cula_kda_segment_scan_prefill(
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
     )
 
-    # Pass 1: seg 0 sees user_init, seg ≥ 1 sees zero (emits h_ext locally).
-    _o_pass1, h_seg = _kda_hopper_call_kernel(
-        prep, scale=scale, safe_gate=safe_gate, num_segments=num_segments,
-        initial_state=initial_state, out_dtype=out_dtype,
-    )
+    if use_full_fla_path:
+        # Skip cuLA Pass 1 — build pass2_init via the full FLA chain.
+        pass2_init = _kda_compute_segment_initial_states_full_fla(
+            prep=prep, initial_state=initial_state,
+            num_segments=num_segments, safe_gate=safe_gate, scale=scale,
+        )
+    else:
+        # 2-pass hybrid: cuLA Pass 1 → bootstrap pass2_init[:, 1] cuLA-consistently.
+        _o_pass1, h_seg = _kda_hopper_call_kernel(
+            prep, scale=scale, safe_gate=safe_gate, num_segments=num_segments,
+            initial_state=initial_state, out_dtype=out_dtype,
+        )
+        pass2_init = _kda_compute_segment_initial_states(
+            prep=prep, h_seg_pass1=h_seg, initial_state=initial_state,
+            num_segments=num_segments, safe_gate=safe_gate, scale=scale,
+        )
 
-    # Build per-segment prefixed init via FLA merge kernel (skipping seg 0).
-    pass2_init = _kda_compute_segment_initial_states(
-        prep=prep, h_seg_pass1=h_seg, initial_state=initial_state,
-        num_segments=num_segments, safe_gate=safe_gate, scale=scale,
-    )
-
-    # Pass 2: cuLA kernel with corrected per-segment init.
+    # Single forward (= old "Pass 2") with corrected per-segment init.
     o, h_final_seg = _kda_hopper_call_kernel(
         prep, scale=scale, safe_gate=safe_gate, num_segments=num_segments,
         initial_state=pass2_init, out_dtype=out_dtype,

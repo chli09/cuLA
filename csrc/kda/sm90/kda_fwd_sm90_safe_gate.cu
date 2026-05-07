@@ -27,7 +27,7 @@ using bf16 = cute::bfloat16_t;
 
 // SafeGate=true, InitState=false, NSeg=1
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -44,11 +44,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, c
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=true, NSeg=1
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -65,11 +66,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, cu
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=false, BetaBF16, NSeg=1
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -86,11 +88,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, c
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=true, BetaBF16, NSeg=1
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -107,7 +110,8 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, cu
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // ── NumSegments = 2 (segment-scan first behaviour change) ────────────────────
 // Only the InitState=true paths are instantiated; segment-scan always sets
@@ -115,7 +119,7 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, cu
 
 // SafeGate=true, InitState=true, NSeg=2
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -132,11 +136,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, cu
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=true, BetaBF16, NSeg=2
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -153,11 +158,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, cu
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=false, NSeg=2  (matches dispatcher when no init_state passed)
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -174,11 +180,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, c
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=false, BetaBF16, NSeg=2
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -195,13 +202,14 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, c
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // ── NumSegments = 4 (segment-scan + FLA M-chain merge target) ────────────────
 
 // SafeGate=true, InitState=true, NSeg=4
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/4, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/4, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -218,11 +226,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/4, cu
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=true, BetaBF16, NSeg=4
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/4, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/4, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -239,11 +248,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/4, cu
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=false, NSeg=4
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/4, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/4, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -260,11 +270,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/4, c
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=false, BetaBF16, NSeg=4
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/4, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/4, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -281,13 +292,14 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/4, c
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // ── NumSegments = 8 (push grid expansion further for the worst case) ─────────
 
 // SafeGate=true, InitState=true, NSeg=8
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/8, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/8, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -304,11 +316,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/8, cu
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=true, BetaBF16, NSeg=8
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/8, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/8, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -325,11 +338,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/8, cu
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=false, NSeg=8
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/8, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/8, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t,
     bf16*,
     float*,
@@ -346,11 +360,12 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/8, c
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // SafeGate=true, InitState=false, BetaBF16, NSeg=8
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/8, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/8, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t,
     bf16*,
     float*,
@@ -367,58 +382,449 @@ launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/8, c
     int32_t,
     int64_t,
     float,
-    int32_t);
+    int32_t,
+    float*);
 
 // ── NumSegments = 16 ─────────────────────────────────────────────────────────
 
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/16, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/16, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
     float const*, float const*, float const*, int32_t const*, uint8_t*,
-    int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
 
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/16, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/16, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
     float const*, float const*, bf16 const*, int32_t const*, uint8_t*,
-    int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
 
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/16, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/16, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
     float const*, float const*, float const*, int32_t const*, uint8_t*,
-    int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
 
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/16, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/16, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
     float const*, float const*, bf16 const*, int32_t const*, uint8_t*,
-    int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
 
 // ── NumSegments = 32 ─────────────────────────────────────────────────────────
 
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/32, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/32, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
     float const*, float const*, float const*, int32_t const*, uint8_t*,
-    int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
 
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/32, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/32, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
     float const*, float const*, bf16 const*, int32_t const*, uint8_t*,
-    int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
 
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/32, cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/32, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float>(
     cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
     float const*, float const*, float const*, int32_t const*, uint8_t*,
-    int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
 
 template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/32, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/32, /*EmitTransition=*/false, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
     float const*, float const*, bf16 const*, int32_t const*, uint8_t*,
-    int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EmitTransition=true variants (Layer 2: per-segment transition matrix M emit)
+// ─────────────────────────────────────────────────────────────────────────────
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/1, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/1, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/2, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/2, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/4, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/4, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/4, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/4, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/8, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/8, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/8, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/8, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    bf16 const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t,
+    float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/16, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
+    float const*, float const*, float const*, int32_t const*, uint8_t*,
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/16, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
+    float const*, float const*, bf16 const*, int32_t const*, uint8_t*,
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/16, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
+    float const*, float const*, float const*, int32_t const*, uint8_t*,
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/16, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
+    float const*, float const*, bf16 const*, int32_t const*, uint8_t*,
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/32, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
+    float const*, float const*, float const*, int32_t const*, uint8_t*,
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, /*NumSegments=*/32, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
+    float const*, float const*, bf16 const*, int32_t const*, uint8_t*,
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/32, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float>(
+    cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
+    float const*, float const*, float const*, int32_t const*, uint8_t*,
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, /*NumSegments=*/32, /*EmitTransition=*/true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t, bf16*, float*, bf16 const*, bf16 const*, bf16 const*,
+    float const*, float const*, bf16 const*, int32_t const*, uint8_t*,
+    int32_t, int32_t, int32_t, int64_t, float, int32_t, float*);
+
 
 }  // namespace kda::sm90

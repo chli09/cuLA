@@ -53,7 +53,7 @@ ChunkKDAFwdRecompWU(
 #endif
 
 #if defined(CULA_SM90A_ENABLED)
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 kda_fwd_prefill(
     std::optional<torch::Tensor> output_,
     std::optional<torch::Tensor> output_state_,
@@ -67,7 +67,9 @@ kda_fwd_prefill(
     torch::Tensor workspace_buffer,
     float scale,
     bool safe_gate,
-    int64_t num_segments);
+    int64_t num_segments,
+    bool emit_transition,
+    std::optional<torch::Tensor> output_M_);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -92,6 +94,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("workspace_buffer"),
         py::arg("scale"),
         py::arg("safe_gate"),
-        py::arg("num_segments") = 1);
+        py::arg("num_segments") = 1,
+        py::arg("emit_transition") = false,
+        py::arg("output_M") = py::none());
 #endif
 }
