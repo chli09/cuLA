@@ -1326,13 +1326,51 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             s_decay(tKVrKV, alpha_last_smem_pipe_read);
             // Layer 2: also apply gate decay to M_cumprod. This corresponds to
             // M_chunk's diagonal part (M_chunk = diag(decay) - kg^T·w; this line
-            // covers the diag(decay) factor only — the kg^T·w correction is not
-            // yet implemented and is the remaining TODO for full Layer 2).
+            // covers the diag(decay) factor only — the kg^T·w correction is the
+            // remaining TODO for full Layer 2).
             // tMrM shares tKVrKV's [V, K] partitioning, so s_decay's V-indexed
             // alpha_last lookup gives `tMrM[i, j] *= decay[i]` — exactly the
             // row-scaling of M_cumprod by diag(decay).
             if constexpr (kEmitTransition) {
                 s_decay(tMrM, alpha_last_smem_pipe_read);
+                //
+                // ┌─────────────────────────────────────────────────────────────────┐
+                // │ TODO (step 2b — Layer 2 completion): subtract kg^T·w·M_old      │
+                // │                                                                  │
+                // │ Current state: we just applied diag(decay) to M_cumprod, giving │
+                // │   M_new = diag(decay) · M_old                                   │
+                // │ Target:                                                          │
+                // │   M_new = diag(decay)·M_old - (kg^T·w)·M_old                    │
+                // │         = M_chunk · M_old   where  M_chunk = diag(decay)-kg^T·w │
+                // │                                                                  │
+                // │ Validated empirically (vast.ai H100 NVL, 2026-05-05) that diag- │
+                // │ only step 2a underflows to ~0 within 3-5 chunks for realistic   │
+                // │ KDA gates (g_cumsum reaching -128 in log2 → exp2(-128) ≈ 5e-20).│
+                // │ The kg^T·w term is not optional — it provides the per-chunk     │
+                // │ structure that prevents pure exponential decay.                  │
+                // │                                                                  │
+                // │ Implementation strategies (see issue11_insight.md "step 2b"):   │
+                // │                                                                  │
+                // │ (i) Materialize W in registers (currently W lives implicitly in │
+                // │     SMEM `sKK_opd` after CollectiveInverse + β scaling). Add 2  │
+                // │     new WGMMA calls per chunk:                                   │
+                // │       tmp = kg^T · w               // [K, K]                    │
+                // │       M_correction = tmp · M_old   // [K, K] @ [K, K]           │
+                // │       tMrM -= M_correction                                       │
+                // │     Need: extra register fragment for w, careful pipeline       │
+                // │     barriers, register-pressure check.                           │
+                // │                                                                  │
+                // │ (ii) Reuse the existing recurrence by running it with V=0 and   │
+                // │      h_init = M_old. This gives M_new = M_chunk · M_old via the │
+                // │      kernel's already-implemented (V - h·K^T)·T_inv·β path.     │
+                // │      Requires duplicating chunk-level matmul stages — register  │
+                // │      pressure roughly doubled.                                   │
+                // │                                                                  │
+                // │ Strategy (ii) is structurally cleanest but costs ~2× per-chunk  │
+                // │ compute. Strategy (i) is more surgical. Estimated 1-3 days      │
+                // │ either way. Hardest sub-task: extracting w from sKK_opd into a  │
+                // │ register fragment with the right WGMMA-compatible layout.       │
+                // └─────────────────────────────────────────────────────────────────┘
             }
 
             // synchronize 2 WGs before rewriting sQ_K_scaled

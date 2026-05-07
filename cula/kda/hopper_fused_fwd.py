@@ -593,6 +593,82 @@ def _kda_compute_segment_initial_states_full_fla(
     return pass2_init
 
 
+def _kda_compute_segment_initial_states_layer2(
+    prep: dict,
+    h_seg_pass1: torch.Tensor,    # [N_seq, N_seg, H, K, V] from cuLA pass 1
+    M_pass1: torch.Tensor,        # [N_seq, N_seg, H, K, K] from cuLA pass 1 (Layer 2)
+    initial_state: torch.Tensor | None,
+    num_segments: int,
+) -> torch.Tensor:
+    """Build per-segment h_initial using cuLA-emitted (h_ext, M) — Layer 2 path.
+
+    This is the Layer-2 counterpart to ``_kda_compute_segment_initial_states``
+    (hybrid 2-pass) and ``_kda_compute_segment_initial_states_full_fla``
+    (FLA-pre_process). It uses the M_seg matrix that cuLA Pass 1 emits when
+    ``emit_transition=True`` to compute pass2_init via direct chain:
+
+        pass2_init[seq, 0]    = user_init
+        pass2_init[seq, k+1]  = M_seg[k] @ pass2_init[seq, k] + h_ext[seq, k]
+
+    where h_ext[seq, k] = h_seg_pass1[seq, k] for k ≥ 1 (Pass 1 ran segs ≥ 1
+    with init=0, so h_seg_pass1[seq, k] = M_k @ 0 + h_ext_k = h_ext_k).
+    For seg 0, h_seg_pass1[seq, 0] is already the corrected init for seg 1
+    (= M_0 @ user_init + h_ext_0).
+
+    Pipeline:
+      1. cuLA Pass 1 runs ONCE with emit_transition=True
+                                 → produces (h_seg_pass1, M_pass1) per segment
+      2. This function chains them on host side via simple matmul loop
+      3. cuLA Pass 2 runs with the corrected pass2_init
+
+    Total: 2 cuLA Pass calls + tiny host loop + 0 FLA Triton kernels.
+    Estimated cost ~570μs (vs ~1.12ms for current hybrid 2-pass).
+
+    ★ NOT YET FUNCTIONAL — depends on Layer 2 step 2b being complete in the
+    kernel. As of 2026-05-05, the cuLA kernel emits M = product(diag(decay))
+    only, missing the kg^T·w correction term. Calling this function with the
+    current kernel produces incorrect pass2_init (M underflows to ~0 for
+    realistic KDA gates, collapsing to init_zero behaviour).
+
+    Once kernel step 2b lands and M is correct, this function should pass the
+    same test_kda_segment_scan tolerance as the hybrid 2-pass path.
+    """
+    num_seqs = prep["num_seqs"]
+    num_heads = prep["num_heads"]
+    head_dim = prep["head_dim"]
+    head_dim_v = prep["head_dim_v"]
+    device = prep["q"].device
+
+    pass2_init = torch.zeros(
+        (num_seqs, num_segments, num_heads, head_dim, head_dim_v),
+        dtype=torch.float32, device=device,
+    )
+    if initial_state is not None:
+        pass2_init[:, 0, ...] = initial_state
+
+    # Seg 1: bootstrap from pass 1's h_seg_pass1[:, 0] which is already
+    # M_0·user_init + h_ext_0 (cuLA-self-consistent).
+    pass2_init[:, 1, ...] = h_seg_pass1[:, 0, ...]
+
+    if num_segments == 2:
+        return pass2_init
+
+    # Segs 2..N-1: chain via cuLA's emitted M.
+    # pass2_init[:, k+1] = M_pass1[:, k] · pass2_init[:, k] + h_seg_pass1[:, k]
+    # for k = 1..N-2.
+    for k in range(1, num_segments - 1):
+        # M_pass1[:, k] shape: [num_seqs, H, K, K]
+        # pass2_init[:, k]:   [num_seqs, H, K, V]
+        # Result:             [num_seqs, H, K, V]
+        M_at_k = M_pass1[:, k, ...]                      # [num_seqs, H, K, K]
+        prev = pass2_init[:, k, ...]                     # [num_seqs, H, K, V]
+        # Use einsum for clarity: out[s, h, i, v] = sum_j M[s, h, i, j] · prev[s, h, j, v]
+        chained = torch.einsum("shij,shjv->shiv", M_at_k, prev)
+        pass2_init[:, k + 1, ...] = chained + h_seg_pass1[:, k, ...]
+
+    return pass2_init
+
+
 class HopperChunkKDAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
