@@ -111,3 +111,50 @@ def test_v2_cu_naive_matches_flashkda(B, T, H):
     assert state_rel_mean < 0.01, f"state mean rel diff {state_rel_mean} too large"
     assert o_rel_max < 0.20, f"o max rel diff {o_rel_max} too large"
     assert state_rel_max < 0.30, f"state max rel diff {state_rel_max} too large"
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H"),
+    [(1, 64, 4), (1, 128, 4)],
+    ids=["B1T64", "B1T128"],
+)
+def test_v2_cu_wmma_matches_flashkda(B, T, H):
+    """C++ WMMA K2 (Tensor Cores) — same correctness target as cu_naive."""
+    K, V = 128, 128
+    q, k, v, g_raw, beta_raw, A_log, dt_bias = _make_inputs(B, T, H, K, V)
+    scale = 1.0 / (K**0.5)
+
+    with torch.inference_mode():
+        o_ref, state_ref = fla_chunk_kda(
+            q=q, k=k, v=v, g=g_raw, beta=beta_raw, scale=scale,
+            A_log=A_log, dt_bias=dt_bias,
+            initial_state=None, output_final_state=True,
+            use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True, transpose_state_layout=True,
+            safe_gate=True, lower_bound=-5.0,
+        )
+
+    o_test, state_test = kda_prefill_hopper_v2(
+        q=q, k=k, v=v, g=g_raw, beta=beta_raw, scale=scale,
+        A_log=A_log, dt_bias=dt_bias,
+        initial_state=None, output_final_state=True,
+        use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+        safe_gate=True, lower_bound=-5.0,
+        transpose_state_layout=True,
+        k2_backend="cu_wmma",
+    )
+
+    o_diff = (o_ref.float() - o_test.float()).abs()
+    state_diff = (state_ref.float() - state_test.float()).abs()
+    o_rel_max = o_diff.max() / max(o_ref.abs().max(), 1e-6)
+    o_rel_mean = o_diff.mean() / max(o_ref.abs().max(), 1e-6)
+    state_rel_max = state_diff.max() / max(state_ref.abs().max(), 1e-6)
+    state_rel_mean = state_diff.mean() / max(state_ref.abs().max(), 1e-6)
+    print(f"\n[B={B} T={T} H={H}] cu_wmma vs FlashKDA:")
+    print(f"  o     rel_max={o_rel_max:.4e}  rel_mean={o_rel_mean:.4e}")
+    print(f"  state rel_max={state_rel_max:.4e}  rel_mean={state_rel_mean:.4e}")
+
+    assert o_rel_mean < 0.01
+    assert state_rel_mean < 0.01
+    assert o_rel_max < 0.20
+    assert state_rel_max < 0.30

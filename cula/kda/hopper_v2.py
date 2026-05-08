@@ -141,9 +141,9 @@ def kda_prefill_hopper_v2(
         # transpose_state_layout=True wants [N, H, V, K]. Match.
         if transpose_state_layout:
             h_state = h_state.transpose(-1, -2).contiguous()
-    elif k2_backend in ("cu_stub", "cu_naive"):
+    elif k2_backend in ("cu_stub", "cu_naive", "cu_wmma"):
         # C++ K2 path (state in [N, H, V, K] transposed layout, FlashKDA convention).
-        backend_id = 0 if k2_backend == "cu_stub" else 1
+        backend_id = {"cu_stub": 0, "cu_naive": 1, "cu_wmma": 2}[k2_backend]
         # chunk_offsets[n] = first chunk index in workspace for sequence n.
         # Computed as prefix sum of NT_per_seq.
         cu_seqlens_cpu = cu_seqlens.to("cpu", non_blocking=False).int()
