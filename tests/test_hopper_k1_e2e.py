@@ -6,32 +6,23 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""End-to-end validation: K1 + Python K2 reference vs FlashKDA dispatch.
+"""End-to-end validation: kda_prefill_hopper_v2 vs FlashKDA dispatch.
 
-Our K1 follows FlashKDA's spec (CHUNK=64 instead of 16 but same workspace
-shapes and conventions). cuLA's existing monolithic fused kernel has its
-own internal conventions that DIFFER from FlashKDA (verified by direct
-comparison: cuLA fused vs `chunk_kda(... torch.inference_mode())` gives
-~0.89 relative diff at B=1, T=64, H=4 — i.e. they're not the same math).
+cuLA's v2 architecture (`kda_prefill_hopper_v2`) uses K1 + Python K2-ref to
+implement FlashKDA-spec KDA on Hopper. This test validates that v2's output
+matches `chunk_kda(... torch.inference_mode())` which dispatches to FlashKDA.
 
-So we validate K1 + K2-ref against FlashKDA (the spec K1 actually targets).
-The cuLA-fused-vs-FlashKDA divergence is a pre-existing issue separate from
-our work.
+cuLA's v1 (`kda_prefill_hopper`, the existing fused kernel) follows different
+internal conventions and produces ~0.89 rel diff vs FlashKDA. v2 is a clean
+re-implementation aligned with FlashKDA's spec.
 """
 
 import pytest
 import torch
-import torch.nn.functional as F
-from fla.modules.l2norm import l2norm_fwd
-from fla.ops.kda.gate import kda_gate_chunk_cumsum
-from fla.ops.utils.constant import RCP_LN2
+from fla.ops.kda import chunk_kda as fla_chunk_kda
 from fla.utils import device
 
-from fla.ops.kda import chunk_kda as fla_chunk_kda
-
-from cula.kda.hopper_k1 import kda_k1_full
-from cula.kda.hopper_k2_reference import kda_k2_reference
-from cula.utils import prepare_uniform_cu_seqlens
+from cula.kda import kda_prefill_hopper_v2
 
 pytestmark = pytest.mark.sm90_only
 
@@ -77,61 +68,17 @@ def test_k1_plus_ref_k2_matches_fused(B, T, H):
             safe_gate=True, lower_bound=-5.0,
         )
 
-    # Our pipeline: replicate FlashKDA preprocessing (l2norm + gate cumsum + sigmoid beta)
-    # then run K1 → workspace → K2 reference.
-
-    # IMPORTANT: A_log must be passed as [H] (1D) — FLA's gate kernel does
-    # `tl.load(A_log + i_h)` which treats A_log as flat 1D and reads element i_h.
-    # If we broadcast to [H, K] then tl.load reads the wrong head's value
-    # (A_log_2d.flat[i_h] = A_log_2d[0, i_h] for small i_h, which is A_log[0]).
-    # This bug previously caused o rel_diff ~0.64 (off-by-head-index in g_cumsum).
-
-    # Pack [B, T, ...] -> [1, B*T, ...]
-    q_4d = q.reshape(1, B * T, H, K).contiguous()
-    k_4d = k.reshape(1, B * T, H, K).contiguous()
-    v_4d = v.reshape(1, B * T, H, V).contiguous()
-    g_4d = g_raw.float().reshape(1, B * T, H, K).contiguous()
-    beta_4d = beta_raw.reshape(1, B * T, H).contiguous()
-    cu_seqlens = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=device)
-
-    # Gate cumsum (FLA expects fp32 g, A_log shape [H])
-    g_cumsum_4d = kda_gate_chunk_cumsum(
-        g=g_4d, A_log=A_log, dt_bias=dt_bias,
-        scale=RCP_LN2, chunk_size=64,
-        cu_seqlens=cu_seqlens, chunk_indices=None,
-        lower_bound=-5.0,
+    # cuLA v2 entry point — matches FlashKDA spec by construction
+    o_test_4d, state_test_TR = kda_prefill_hopper_v2(
+        q=q, k=k, v=v, g=g_raw, beta=beta_raw,
+        scale=scale,
+        A_log=A_log, dt_bias=dt_bias,
+        initial_state=None, output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        safe_gate=True, lower_bound=-5.0,
+        transpose_state_layout=True,
     )
-
-    # L2 norm q, k
-    q_l2, _ = l2norm_fwd(q_4d)
-    k_l2, _ = l2norm_fwd(k_4d)
-
-    # Sigmoid beta (since cuLA fused has use_beta_sigmoid_in_kernel implicit)
-    beta_sig = beta_4d.float().sigmoid()
-
-    # Pack to 3D for K1
-    q_pk = q_l2.reshape(B * T, H, K).contiguous()
-    k_pk = k_l2.reshape(B * T, H, K).contiguous()
-    v_pk = v_4d.reshape(B * T, H, V).contiguous()
-    g_pk = g_cumsum_4d.reshape(B * T, H, K).contiguous()
-    beta_pk = beta_sig.reshape(B * T, H).contiguous()
-
-    # K1 → workspace
-    ws = kda_k1_full(q_pk, k_pk, g_pk, beta_pk, scale, cu_seqlens=cu_seqlens, chunk_size=64)
-
-    # K2 reference → (o, state). Note: K2 reference takes beta as input (for delta-rule
-    # residual scaling); K1 already used beta to build INV.
-    o_test, state_test = kda_k2_reference(
-        ws, v_pk, beta_pk, h_initial=None,
-        cu_seqlens=cu_seqlens, chunk_size=64,
-    )
-
-    # Reshape o_test back to [B, T, H, V] to match FLA output
-    o_test_4d = o_test.reshape(B, T, H, V)
-
-    # FlashKDA returns state with transpose_state_layout=True → shape [N, H, V, K]
-    # Our K2 ref has state shape [N, H, K, V]. Transpose to compare.
-    state_test_TR = state_test.transpose(-1, -2).contiguous()
 
     # Compare
     o_diff = (o_ref.float() - o_test_4d.float()).abs()
