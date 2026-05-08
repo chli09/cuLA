@@ -14,6 +14,7 @@
 #include <torch/extension.h>
 
 #include "kda/sm90/kda_fwd_v2_stub.cuh"
+#include "kda/sm90/kda_fwd_v2_naive.cuh"
 
 using OptionalTensor = std::optional<torch::Tensor>;
 
@@ -31,7 +32,9 @@ kda_fwd_v2(
     torch::Tensor const& ws_inv,
     OptionalTensor initial_state_,
     torch::Tensor const& cu_seqlens,
-    int64_t chunk_size) {
+    torch::Tensor const& chunk_offsets,
+    int64_t chunk_size,
+    int64_t backend) {  // 0 = stub, 1 = naive
     // Shape assumptions (mirror cuLA Hopper conventions):
     //   v: [packed_seq, H, V] bf16
     //   beta: [packed_seq, H] fp32 (post-sigmoid)
@@ -69,13 +72,43 @@ kda_fwd_v2(
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // STUB: just zero out the outputs. Replace with real K2 math in a follow-up.
-    kda::sm90::v2::launch_kda_fwd_v2_stub(
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-        output_state.data_ptr<float>(),
-        output.numel(),
-        output_state.numel(),
-        stream);
+    if (backend == 0) {
+        // STUB: zero out outputs
+        kda::sm90::v2::launch_kda_fwd_v2_stub(
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            output_state.data_ptr<float>(),
+            output.numel(),
+            output_state.numel(),
+            stream);
+    } else if (backend == 1) {
+        // NAIVE: real K2 math via plain CUDA + SMEM
+        TORCH_CHECK(chunk_offsets.dtype() == torch::kInt32, "chunk_offsets must be int32");
+        TORCH_CHECK(chunk_size == 64, "naive backend requires chunk_size=64");
+
+        const float* init_ptr = initial_state_.has_value()
+            ? initial_state_.value().data_ptr<float>()
+            : nullptr;
+
+        kda::sm90::v2::launch_kda_fwd_v2_naive(
+            reinterpret_cast<const __nv_bfloat16*>(ws_qd.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(ws_kd.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(ws_kr.data_ptr()),
+            ws_gt.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(ws_mqk.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(ws_inv.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
+            beta.data_ptr<float>(),
+            init_ptr,
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            output_state.data_ptr<float>(),
+            cu_seqlens.data_ptr<int32_t>(),
+            chunk_offsets.data_ptr<int32_t>(),
+            num_seqs,
+            num_heads,
+            stream);
+    } else {
+        TORCH_CHECK(false, "Unknown backend: ", backend);
+    }
 
     return {output, output_state};
 }

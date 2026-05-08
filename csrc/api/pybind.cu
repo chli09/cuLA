@@ -80,7 +80,9 @@ kda_fwd_v2(
     torch::Tensor const& ws_inv,
     std::optional<torch::Tensor> initial_state_,
     torch::Tensor const& cu_seqlens,
-    int64_t chunk_size);
+    torch::Tensor const& chunk_offsets,
+    int64_t chunk_size,
+    int64_t backend);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

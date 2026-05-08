@@ -141,9 +141,21 @@ def kda_prefill_hopper_v2(
         # transpose_state_layout=True wants [N, H, V, K]. Match.
         if transpose_state_layout:
             h_state = h_state.transpose(-1, -2).contiguous()
-    elif k2_backend == "cu_stub":
-        # C++ K2 stub. Inputs/outputs follow FlashKDA convention with
-        # transpose_state_layout=True (state is [N, H, V, K]).
+    elif k2_backend in ("cu_stub", "cu_naive"):
+        # C++ K2 path (state in [N, H, V, K] transposed layout, FlashKDA convention).
+        backend_id = 0 if k2_backend == "cu_stub" else 1
+        # chunk_offsets[n] = first chunk index in workspace for sequence n.
+        # Computed as prefix sum of NT_per_seq.
+        cu_seqlens_cpu = cu_seqlens.to("cpu", non_blocking=False).int()
+        nt_per_seq = []
+        for i in range(cu_seqlens_cpu.numel() - 1):
+            t_seq = (cu_seqlens_cpu[i + 1] - cu_seqlens_cpu[i]).item()
+            nt_per_seq.append((t_seq + chunk_size - 1) // chunk_size)
+        offsets = [0]
+        for nt in nt_per_seq:
+            offsets.append(offsets[-1] + nt)
+        chunk_offsets = torch.tensor(offsets, dtype=torch.int32, device=cu_seqlens.device)
+
         o_3d, h_state = cula_cuda.kda_fwd_v2(
             None,
             None,
@@ -157,10 +169,12 @@ def kda_prefill_hopper_v2(
             ws["ws_inv"],
             initial_state,
             cu_seqlens,
+            chunk_offsets,
             chunk_size,
+            backend_id,
         )
-        # Stub already produces [N, H, V, K] state. If caller doesn't want
-        # transposed layout, transpose back.
+        # Output already produces [N, H, V, K] state. If caller doesn't want transposed,
+        # flip back.
         if not transpose_state_layout:
             h_state = h_state.transpose(-1, -2).contiguous()
     else:
