@@ -19,6 +19,7 @@
 #include "kda/sm90/kda_fwd_v2_wsp.cuh"
 #include "kda/sm90/kda_fwd_v2_wsp2.cuh"
 #include "kda/sm90/kda_fwd_v2_part.cuh"
+#include "kda/sm90/kda_fwd_v2_fused.cuh"
 
 using OptionalTensor = std::optional<torch::Tensor>;
 
@@ -120,6 +121,32 @@ kda_fwd_v2(
             : nullptr;
 
         kda::sm90::v2::wmma_impl::launch_kda_fwd_v2_wmma(
+            reinterpret_cast<const __nv_bfloat16*>(ws_qd.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(ws_kd.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(ws_kr.data_ptr()),
+            ws_gt.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(ws_mqk.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(ws_inv.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
+            beta.data_ptr<float>(),
+            init_ptr,
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            output_state.data_ptr<float>(),
+            cu_seqlens.data_ptr<int32_t>(),
+            chunk_offsets.data_ptr<int32_t>(),
+            num_seqs,
+            num_heads,
+            stream);
+    } else if (backend == 6) {
+        // FUSED: step 1+5 share state b_frag loads (Step H-1)
+        TORCH_CHECK(chunk_offsets.dtype() == torch::kInt32, "chunk_offsets must be int32");
+        TORCH_CHECK(chunk_size == 64, "fused backend requires chunk_size=64");
+
+        const float* init_ptr = initial_state_.has_value()
+            ? initial_state_.value().data_ptr<float>()
+            : nullptr;
+
+        kda::sm90::v2::fused_impl::launch_kda_fwd_v2_fused(
             reinterpret_cast<const __nv_bfloat16*>(ws_qd.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(ws_kd.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(ws_kr.data_ptr()),
