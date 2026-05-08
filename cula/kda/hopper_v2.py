@@ -35,6 +35,7 @@ from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils.constant import RCP_LN2
 
+import cula.cudac as cula_cuda
 from cula.kda.hopper_k1 import kda_k1_full
 from cula.kda.hopper_k2_reference import kda_k2_reference
 from cula.utils import assert_hopper, prepare_uniform_cu_seqlens
@@ -58,6 +59,7 @@ def kda_prefill_hopper_v2(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     transpose_state_layout: bool = True,
+    k2_backend: str = "python_ref",
 ):
     """v2 KDA prefill on Hopper, FlashKDA-spec.
 
@@ -123,18 +125,46 @@ def kda_prefill_hopper_v2(
     # K1: produces 6 workspace tensors
     ws = kda_k1_full(q_pk, k_pk, g_pk, beta_pk, scale, cu_seqlens=cu_seqlens, chunk_size=chunk_size)
 
-    # K2: per-chunk recurrence + o + state update (Python eager reference for now;
-    # ★ replace with CUTLASS C++ kernel in a future change to realize speedup)
-    o_3d, h_state = kda_k2_reference(
-        ws, v_pk, beta_pk,
-        h_initial=initial_state,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-    )
-    # h_state shape [N, H, K, V]. FlashKDA / FLA convention with transpose_state_layout=True
-    # wants [N, H, V, K]. Match that by transposing the last two dims.
-    if transpose_state_layout:
-        h_state = h_state.transpose(-1, -2).contiguous()
+    # K2: per-chunk recurrence + o + state update.
+    # Two backends:
+    #   - "python_ref" (default): slow but matches FlashKDA spec (validated e2e)
+    #   - "cu_stub": calls the C++ stub kernel — currently returns zeros
+    #     (placeholder; real K2 math TODO).
+    if k2_backend == "python_ref":
+        o_3d, h_state = kda_k2_reference(
+            ws, v_pk, beta_pk,
+            h_initial=initial_state,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+        )
+        # h_state shape [N, H, K, V]. FlashKDA / FLA convention with
+        # transpose_state_layout=True wants [N, H, V, K]. Match.
+        if transpose_state_layout:
+            h_state = h_state.transpose(-1, -2).contiguous()
+    elif k2_backend == "cu_stub":
+        # C++ K2 stub. Inputs/outputs follow FlashKDA convention with
+        # transpose_state_layout=True (state is [N, H, V, K]).
+        o_3d, h_state = cula_cuda.kda_fwd_v2(
+            None,
+            None,
+            v_pk,
+            beta_pk,
+            ws["ws_qd"],
+            ws["ws_kd"],
+            ws["ws_kr"],
+            ws["ws_gt"],
+            ws["ws_mqk"],
+            ws["ws_inv"],
+            initial_state,
+            cu_seqlens,
+            chunk_size,
+        )
+        # Stub already produces [N, H, V, K] state. If caller doesn't want
+        # transposed layout, transpose back.
+        if not transpose_state_layout:
+            h_state = h_state.transpose(-1, -2).contiguous()
+    else:
+        raise ValueError(f"Unknown k2_backend: {k2_backend!r}")
 
     # Reshape o back to [B, T, H, V]
     o_4d = o_3d.reshape(B, T, H, V)

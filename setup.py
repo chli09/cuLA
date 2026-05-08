@@ -159,6 +159,7 @@ if not DISABLE_SM90:
     cuda_sources.extend(
         [
             "csrc/api/kda_sm90.cu",
+            "csrc/api/kda_v2_sm90.cu",
             "csrc/kda/sm90/kda_fwd_sm90.cu",
             "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
         ]
