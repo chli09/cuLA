@@ -52,14 +52,19 @@ class HopperFlashKDAFunction(torch.autograd.Function):
         scale: float,
         initial_state: torch.Tensor | None,
         output_final_state: bool,
+        use_beta_sigmoid_in_kernel: bool,
         lower_bound: float,
         cu_seqlens: torch.IntTensor | None,
     ):
         B, T_seq, H, D = q.shape
         T_total = B * T_seq
 
-        # Beta dtype: FlashKDA C++ requires bf16. Cast if user passed fp32.
-        if beta.dtype != torch.bfloat16:
+        # Beta convention reconciliation: FlashKDA K1 always applies sigmoid
+        # internally. cuLA's chunk_kda convention is post-sigmoid beta in (0,1).
+        # When use_beta_sigmoid_in_kernel=False, take logit so K1's sigmoid recovers it.
+        if not use_beta_sigmoid_in_kernel:
+            beta = torch.logit(beta.float().clamp(1e-6, 1 - 1e-6)).to(torch.bfloat16)
+        elif beta.dtype != torch.bfloat16:
             beta = beta.to(torch.bfloat16)
 
         # cu_seqlens dtype: cuLA standard is int32, FlashKDA expects int64.
@@ -127,6 +132,7 @@ def kda_prefill_hopper_flashkda(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
     use_gate_in_kernel: bool = True,
+    use_beta_sigmoid_in_kernel: bool = False,
     safe_gate: bool = True,
     lower_bound: float | None = None,
     cu_seqlens: torch.IntTensor | None = None,
@@ -143,8 +149,12 @@ def kda_prefill_hopper_flashkda(
         q, k, v: ``[B, T, H, D]`` bf16. ``D`` must be 128.
         g: pre-activation gate ``[B, T, H, D]`` bf16 (raw — K1 applies the
             sigmoid + lower_bound + cumsum internally).
-        beta: ``[B, T, H]`` bf16 or fp32 (cast to bf16 internally; sigmoid
-            applied inside the kernel).
+        beta: ``[B, T, H]`` bf16 or fp32. When ``use_beta_sigmoid_in_kernel=False``
+            (default, matching :func:`cula.kda.kda_prefill_hopper`) beta is taken
+            as already-sigmoided values in ``(0, 1)`` and a logit is applied in
+            the wrapper before passing to FlashKDA's K1 (which always sigmoids
+            internally). When ``True``, beta is treated as raw pre-activation
+            logits and passed straight through.
         scale: defaults to ``1 / sqrt(D)`` if ``None``.
         initial_state: ``[N, H, V, K]`` (K-last) bf16 or fp32, or ``None``. Same
             convention as :func:`cula.kda.kda_prefill_hopper`.
@@ -205,6 +215,7 @@ def kda_prefill_hopper_flashkda(
         scale,
         initial_state,
         output_final_state,
+        use_beta_sigmoid_in_kernel,
         lower_bound,
         cu_seqlens,
     )
