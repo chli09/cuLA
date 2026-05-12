@@ -66,6 +66,24 @@ kda_fwd_prefill(
     float scale,
     bool output_final_state,
     bool safe_gate);
+
+int64_t flashkda_get_workspace_size(int64_t T_total, int64_t H, int64_t N);
+
+void flashkda_fwd_prefill(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor g,
+    torch::Tensor beta,
+    double scale,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    torch::Tensor A_log,
+    torch::Tensor dt_bias,
+    double lower_bound,
+    std::optional<torch::Tensor> initial_state,
+    std::optional<torch::Tensor> final_state,
+    std::optional<torch::Tensor> cu_seqlens);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -76,5 +94,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
 #if defined(CULA_SM90A_ENABLED)
     m.def("kda_fwd_prefill", &kda_fwd_prefill);
+    m.def(
+        "flashkda_fwd_prefill",
+        &flashkda_fwd_prefill,
+        py::arg("q"),
+        py::arg("k"),
+        py::arg("v"),
+        py::arg("g"),
+        py::arg("beta"),
+        py::arg("scale"),
+        py::arg("out"),
+        py::arg("workspace"),
+        py::arg("A_log"),
+        py::arg("dt_bias"),
+        py::arg("lower_bound"),
+        py::arg("initial_state") = py::none(),
+        py::arg("final_state") = py::none(),
+        py::arg("cu_seqlens") = py::none());
+    m.def(
+        "flashkda_get_workspace_size",
+        &flashkda_get_workspace_size,
+        py::arg("T_total"),
+        py::arg("H"),
+        py::arg("N") = 1);
 #endif
 }

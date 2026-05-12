@@ -161,6 +161,8 @@ if not DISABLE_SM90:
             "csrc/api/kda_sm90.cu",
             "csrc/kda/sm90/kda_fwd_sm90.cu",
             "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
+            "csrc/api/kda_sm90_flashkda.cu",
+            "csrc/kda/sm90_flashkda/fwd_launch.cu",
         ]
     )
 
