@@ -124,8 +124,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     using StagesO = cutlass::gemm::collective::StageCount<1>;
     using ClusterShape = Shape<_1, _1, _1>;
 
-    using StagesQK = cutlass::gemm::collective::StageCount<2>;
-    using StagesKK = cutlass::gemm::collective::StageCount<2>;
+    using StagesQK = cutlass::gemm::collective::StageCount<3>;
+    using StagesKK = cutlass::gemm::collective::StageCount<3>;
 
     using StagesAlpha = cutlass::gemm::collective::StageCount<2>;
     using StagesBeta = cutlass::gemm::collective::StageCount<2>;
