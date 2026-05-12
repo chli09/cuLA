@@ -137,17 +137,17 @@ launch_kda_fwd_prefill_kernel_gbai(
         cutlass::Status status;
         status = op.can_implement(arguments);
         if (status != cutlass::Status::kSuccess) {
-            throw std::runtime_error("can_implement failed");
+            throw std::runtime_error(std::string("can_implement failed: ") + cutlass::cutlassGetStatusString(status));
         }
 
         status = op.initialize(arguments, workspace_buffer, stream);
         if (status != cutlass::Status::kSuccess) {
-            throw std::runtime_error("initialize failed");
+            throw std::runtime_error(std::string("initialize failed: ") + cutlass::cutlassGetStatusString(status));
         }
 
         status = op.run(stream);
         if (status != cutlass::Status::kSuccess) {
-            throw std::runtime_error("run failed");
+            throw std::runtime_error(std::string("run failed: ") + cutlass::cutlassGetStatusString(status));
         }
 
     } else {
